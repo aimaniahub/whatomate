@@ -10,11 +10,13 @@ const props = defineProps<{ data: any }>()
 const buttons = computed(() => props.data?.config?.buttons || [])
 
 const outputHandles = computed(() => {
-  return buttons.value.map((b: any) => ({
-    id: b.id,
-    label: b.title || '—',
-    title: b.title || '—',
-  }))
+  return buttons.value
+    .filter((b: any) => !b.type || b.type === 'reply') // only reply buttons route edges
+    .map((b: any) => ({
+      id: `button:${b.id}`,          // must match the "button:<id>" outcome from execChatButtons
+      label: b.title || '—',
+      title: b.title || '—',
+    }))
 })
 </script>
 

@@ -534,20 +534,57 @@ function loadGraph(graph: ChatFlowGraph) {
     deletable: n.type !== 'start',
   }))
 
-  const vfEdges = (graph.edges || []).map((e, idx) => ({
-    id: `edge_${idx}`,
-    source: e.from,
-    target: e.to,
-    // BaseNode's plain source handle has no id, so only attach a
-    // sourceHandle for branch conditions (button:*, true/false,
-    // in_hours/out_of_hours). Plain "default" edges leave it
-    // undefined and Vue Flow routes to the node's only target.
-    sourceHandle: e.condition !== 'default' ? e.condition : undefined,
-    type: 'default' as const,
-    animated: true,
-    markerEnd: MarkerType.ArrowClosed,
-    label: e.condition !== 'default' ? e.condition : '',
-  }))
+  // Build a lookup: nodeId → Set of button IDs for all buttons-type nodes.
+  // Used below to migrate legacy edge conditions that lack the "button:" prefix.
+  const buttonsNodeButtonIds = new Map<string, Set<string>>()
+  for (const n of graph.nodes) {
+    if (n.type === 'buttons' && Array.isArray(n.config?.buttons)) {
+      const ids = new Set<string>(
+        (n.config.buttons as any[])
+          .filter((b: any) => !b.type || b.type === 'reply')
+          .map((b: any) => b.id)
+          .filter(Boolean),
+      )
+      if (ids.size > 0) buttonsNodeButtonIds.set(n.id, ids)
+    }
+  }
+
+  const vfEdges = (graph.edges || []).map((e, idx) => {
+    // Migrate legacy edge conditions: if this edge comes from a buttons node
+    // and the condition is a bare button ID (no "button:" prefix, not "default"),
+    // auto-prefix it so the canvas and re-saved flow use the correct format.
+    let condition = e.condition
+    if (
+      condition !== 'default' &&
+      !condition.startsWith('button:') &&
+      !condition.startsWith('http:') &&
+      condition !== 'true' &&
+      condition !== 'false' &&
+      condition !== 'in_hours' &&
+      condition !== 'out_of_hours' &&
+      condition !== 'validation_failed' &&
+      condition !== 'max_retries'
+    ) {
+      const btnIds = buttonsNodeButtonIds.get(e.from)
+      if (btnIds && btnIds.has(condition)) {
+        condition = `button:${condition}`
+      }
+    }
+    return {
+      id: `edge_${idx}`,
+      source: e.from,
+      target: e.to,
+      // BaseNode's plain source handle has no id, so only attach a
+      // sourceHandle for branch conditions (button:*, true/false,
+      // in_hours/out_of_hours). Plain "default" edges leave it
+      // undefined and Vue Flow routes to the node's only target.
+      sourceHandle: condition !== 'default' ? condition : undefined,
+      type: 'default' as const,
+      animated: true,
+      markerEnd: MarkerType.ArrowClosed,
+      label: condition !== 'default' ? condition : '',
+    }
+  })
 
   if (!hasStart) {
     // Place start directly above the original entry so the auto-wired
@@ -1000,6 +1037,10 @@ onMounted(async () => {
       variant="destructive"
       @confirm="confirmDeleteSelectedNode"
     />
-    <UnsavedChangesDialog v-model:open="cancelDialogOpen" @confirm="confirmCancel" />
+    <UnsavedChangesDialog
+      :open="cancelDialogOpen"
+      @stay="cancelDialogOpen = false"
+      @leave="confirmCancel"
+    />
   </div>
 </template>

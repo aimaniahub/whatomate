@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/shridarpatil/whatomate/internal/models"
 )
@@ -110,6 +111,12 @@ func (g *ChatGraph) getNode(id string) *ChatNode {
 // resolveEdge returns the target node ID for a given outcome from fromID.
 // Exact condition match wins; otherwise falls back to a "default" edge.
 // Returns "" when no edge matches (terminal).
+//
+// Special backward-compatibility rule for button outcomes:
+// Flows saved before the "button:" prefix convention stored edge conditions
+// as bare button IDs (e.g. "Registration Hub" instead of "button:Registration Hub").
+// If no exact match is found for a "button:<id>" outcome, resolveEdge tries
+// the bare id so old flows route correctly without requiring a re-save.
 func (g *ChatGraph) resolveEdge(fromID, outcome string) string {
 	var def string
 	for _, e := range g.edgeMap[fromID] {
@@ -120,5 +127,16 @@ func (g *ChatGraph) resolveEdge(fromID, outcome string) string {
 			def = e.To
 		}
 	}
+	// Backward-compatibility fallback for button outcomes: also check bare IDs
+	// (edges saved before the "button:" prefix was introduced).
+	if strings.HasPrefix(outcome, "button:") {
+		bareID := outcome[len("button:"):]
+		for _, e := range g.edgeMap[fromID] {
+			if e.Condition == bareID {
+				return e.To
+			}
+		}
+	}
 	return def
 }
+
