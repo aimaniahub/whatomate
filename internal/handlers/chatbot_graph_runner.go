@@ -175,6 +175,23 @@ func (a *App) runChatGraph(
 		next := graph.resolveEdge(node.ID, res.outcome)
 		if next == "" {
 			// No matching edge → terminal.
+			// For button: outcomes this is almost always a ghost-edge
+			// mismatch: the button ID was renamed in the editor after the
+			// edge was drawn. Log the available conditions to make
+			// diagnosis instant from the server log.
+			if strings.HasPrefix(res.outcome, "button:") {
+				available := make([]string, 0)
+				for _, e := range graph.edgeMap[node.ID] {
+					available = append(available, e.Condition)
+				}
+				a.Log.Warn("chat graph: no edge matched button outcome \u2014 possible ghost-edge (button ID renamed after edge was drawn)",
+					"session", session.ID,
+					"node", node.ID,
+					"node_type", node.Type,
+					"outcome", res.outcome,
+					"available_conditions", available,
+				)
+			}
 			session.Status = models.SessionStatusCompleted
 			return a.persistChatSession(session)
 		}

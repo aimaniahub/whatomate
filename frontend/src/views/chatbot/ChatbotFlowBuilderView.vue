@@ -354,6 +354,72 @@ function onUpdateNode(updated: ChatNode) {
     // so this swap has to land back in the canvas state too.
     node.type = updated.type
   }
+
+  // ── Ghost-edge reconciliation ─────────────────────────────────────────
+  // When a buttons node's button IDs are changed or buttons are removed,
+  // any edges whose sourceHandle was set to the old "button:<id>" become
+  // orphaned. The backend resolveEdge then silently finds no matching
+  // condition and the chat freezes. We fix this in three steps:
+  //
+  //  1. ID renamed  → patch the edge sourceHandle + label in-place.
+  //  2. Button added → no action needed (no edge yet).
+  //  3. Button removed → sever (remove) the edge immediately.
+  //
+  // This runs on every node update so it also catches cases where the
+  // user reverts an ID change before saving.
+  if (updated.type === 'buttons' || node.type === 'buttons') {
+    const oldButtons: any[] = (node.data?.config?.buttons) ?? []
+    const newButtons: any[] = (updated.config?.buttons) ?? []
+
+    // Build a set of all NEW button IDs for fast lookup
+    const newButtonIds = new Set<string>(
+      newButtons.map((b: any) => b?.id).filter(Boolean)
+    )
+
+    // Build a map of index-matched oldId → newId for renamed buttons.
+    // We match by array index (same position = same button being edited).
+    const idRenames = new Map<string, string>()
+    oldButtons.forEach((oldBtn: any, idx: number) => {
+      const newBtn = newButtons[idx]
+      const oldId: string = oldBtn?.id ?? ''
+      const newId: string = newBtn?.id ?? ''
+      if (oldId && newId && oldId !== newId) {
+        idRenames.set(oldId, newId)
+      }
+    })
+
+    // Step 1: patch renamed-button edges
+    if (idRenames.size > 0) {
+      edges.value.forEach((edge) => {
+        if (edge.source !== node.id) return
+        const sh = edge.sourceHandle ?? ''
+        if (!sh.startsWith('button:')) return
+        const oldId = sh.slice('button:'.length)
+        if (!idRenames.has(oldId)) return
+        const newId = idRenames.get(oldId)!
+        const newHandle = `button:${newId}`
+        edge.sourceHandle = newHandle
+        // Edge label mirrors the condition so the canvas stays readable
+        edge.label = newHandle
+      })
+    }
+
+    // Step 2 & 3: sever edges whose button no longer exists at all
+    // (covers deletions and IDs that disappeared without a same-index rename)
+    const edgesToRemove = edges.value.filter((edge) => {
+      if (edge.source !== node.id) return false
+      const sh = edge.sourceHandle ?? ''
+      if (!sh.startsWith('button:')) return false
+      const btnId = sh.slice('button:'.length)
+      // Keep if the ID still exists in newButtons (possibly just renamed above)
+      return !newButtonIds.has(btnId) && !idRenames.has(btnId)
+    })
+    if (edgesToRemove.length > 0) {
+      removeEdges(edgesToRemove)
+    }
+  }
+  // ── End ghost-edge reconciliation ─────────────────────────────────────
+
   node.data = {
     ...node.data,
     label: updated.label,

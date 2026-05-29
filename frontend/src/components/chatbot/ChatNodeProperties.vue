@@ -90,24 +90,62 @@ function updateTextBody(value: string) {
 }
 
 // Buttons helpers
+
+/**
+ * Converts a human-readable button title into a stable, lowercase slug that
+ * WhatsApp can echo back as a ButtonReply.ID and the graph runner can match
+ * against edge conditions stored as "button:<slug>".
+ *
+ * Rules: lowercase, replace spaces/special chars with underscores,
+ * collapse consecutive underscores, strip leading/trailing underscores,
+ * truncate to 20 chars (WhatsApp button ID limit).
+ */
+function slugifyButtonTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/_{2,}/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 20)
+}
+
 function addReplyButton() {
   const buttons = [...(config.value.buttons || [])]
-  const id = `btn_${Date.now()}_${buttons.length}`
-  buttons.push({ id, title: '', type: 'reply' })
+  // Start with empty title and empty id — the user will fill both in.
+  // An empty id is obvious-enough to prompt action; the placeholder text
+  // explains what to put there.
+  buttons.push({ id: '', title: '', type: 'reply' })
   updateConfig('buttons', buttons)
 }
 
 function addUrlButton() {
   const buttons = [...(config.value.buttons || [])]
-  const id = `btn_${Date.now()}_${buttons.length}`
-  buttons.push({ id, title: '', type: 'url', url: '' })
+  buttons.push({ id: '', title: '', type: 'url', url: '' })
   updateConfig('buttons', buttons)
 }
 
 function addPhoneButton() {
   const buttons = [...(config.value.buttons || [])]
-  const id = `btn_${Date.now()}_${buttons.length}`
-  buttons.push({ id, title: '', type: 'phone', phone_number: '' })
+  buttons.push({ id: '', title: '', type: 'phone', phone_number: '' })
+  updateConfig('buttons', buttons)
+}
+
+/**
+ * updateButtonTitle — updates the button title AND auto-fills the ID when
+ * the ID field is still empty or still equals the slug of the *previous* title.
+ * This prevents ghost edges by keeping the edge-routing ID in sync with what
+ * the user is naming the button, while still letting them override it manually.
+ */
+function updateButtonTitle(idx: number, newTitle: string) {
+  const buttons = [...(config.value.buttons || [])]
+  const btn = { ...buttons[idx] }
+  const oldSlug = slugifyButtonTitle(btn.title || '')
+  // Auto-update id only when: id is blank, or id still matches the old slug
+  if (!btn.id || btn.id === oldSlug) {
+    btn.id = slugifyButtonTitle(newTitle)
+  }
+  btn.title = newTitle
+  buttons[idx] = btn
   updateConfig('buttons', buttons)
 }
 
@@ -349,20 +387,34 @@ const typeLabel: Record<string, string> = {
             <span class="text-[10px] uppercase text-muted-foreground w-12">{{ btn.type || 'reply' }}</span>
             <Input
               :model-value="btn.title || ''"
-              @update:model-value="(v: string) => updateButton(Number(idx), 'title', v)"
-              placeholder="Button Title"
+              @update:model-value="(v: string) => updateButtonTitle(Number(idx), v)"
+              placeholder="Button label (shown to user)"
               class="h-7 text-xs flex-1"
             />
             <Button variant="ghost" size="icon" class="h-6 w-6" @click="removeButton(Number(idx))">
               <Trash2 class="h-3 w-3 text-destructive" />
             </Button>
           </div>
-          <Input
-            :model-value="btn.id || ''"
-            @update:model-value="(v: string) => updateButton(Number(idx), 'id', v)"
-            placeholder="button_id"
-            class="h-7 text-xs font-mono"
-          />
+          <!-- Button ID — this is what WhatsApp echoes back and what the
+               backend uses to find the correct outgoing edge. It must be
+               stable: editing it here auto-patches any connected edge. -->
+          <div class="relative">
+            <Input
+              :model-value="btn.id || ''"
+              @update:model-value="(v: string) => updateButton(Number(idx), 'id', v)"
+              placeholder="routing_id (auto-filled from title)"
+              :class="'h-7 text-xs font-mono pr-6' + (!btn.id ? ' border-destructive/60 focus-visible:ring-destructive/40' : '')"
+            />
+            <!-- Visual hint: warn when ID is blank (will break routing) -->
+            <span
+              v-if="!btn.id"
+              class="absolute right-2 top-1/2 -translate-y-1/2 text-destructive text-[10px] font-bold pointer-events-none"
+              title="Button ID is required for edge routing"
+            >!</span>
+          </div>
+          <p v-if="!btn.id" class="text-[10px] text-destructive">
+            ⚠ Button ID is empty — set it to match what WhatsApp sends back (e.g. <code>registration_hub</code>). Without it the flow cannot route after this button is pressed.
+          </p>
           <Input
             v-if="btn.type === 'url'"
             :model-value="btn.url || ''"
@@ -378,7 +430,9 @@ const typeLabel: Record<string, string> = {
             class="h-7 text-xs font-mono"
           />
         </div>
-        <p class="text-[10px] text-muted-foreground">Reply buttons (max 10) send the user's choice back. URL / Phone buttons (max 2 per node, mutually exclusive with Reply) open a link or call. Wire reply buttons to next nodes by dragging from the button handle on the canvas.</p>
+        <p class="text-[10px] text-muted-foreground">
+          The <strong>Button ID</strong> (monospace field) is sent by WhatsApp when the user taps a reply button — it must exactly match the edge condition stored in the flow graph. Changing the ID here automatically patches connected edges on the canvas.
+        </p>
       </div>
 
       <!-- Input — buttons always expect a button selection; surface this

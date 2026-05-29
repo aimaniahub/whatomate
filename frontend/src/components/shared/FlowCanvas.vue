@@ -88,6 +88,10 @@ defineEmits<{
   fill: transparent;
 }
 
+.vue-flow__edge-text {
+  fill: #ffffff !important;
+}
+
 .selected-node {
   outline: none;
   border-radius: 0.5rem;
