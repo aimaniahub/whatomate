@@ -36,6 +36,7 @@ import {
   Plus,
   Trash2,
   Play,
+  Table2,
 } from 'lucide-vue-next'
 
 import AuditLogPanel from '@/components/shared/AuditLogPanel.vue'
@@ -46,6 +47,7 @@ import ErrorState from '@/components/shared/ErrorState.vue'
 import ChatNodeProperties from '@/components/chatbot/ChatNodeProperties.vue'
 import PanelConfigEditor from '@/components/chatbot/PanelConfigEditor.vue'
 import type { PanelConfig, AvailableVariable } from '@/components/chatbot/PanelConfigEditor.vue'
+import FlowRoutingTable from '@/components/chatbot/FlowRoutingTable.vue'
 
 import ChatbotTextNode from '@/components/chatbot/nodes/ChatbotTextNode.vue'
 import ChatbotButtonsNode from '@/components/chatbot/nodes/ChatbotButtonsNode.vue'
@@ -91,6 +93,7 @@ const hasUnsavedChanges = ref(false)
 const showDeleteNodeConfirm = ref(false)
 const cancelDialogOpen = ref(false)
 const showPreview = ref(false)
+const showRoutingTable = ref(false)
 const auditRefreshKey = ref(0)
 const completionConfigOpen = ref(false)
 const panelConfigOpen = ref(false)
@@ -765,6 +768,19 @@ watch([name, description, enabled, triggerKeywords, initialMessage, completionMe
   if (!isLoading.value) hasUnsavedChanges.value = true
 })
 
+/**
+ * Called by FlowRoutingTable when the user rewires an edge via the
+ * Destination dropdown. Removes the old edge and optionally adds a new one,
+ * then marks the flow dirty so Save Flow activates.
+ */
+function handleRewire({ removeEdgeId, newEdge }: { removeEdgeId: string; newEdge: import('@vue-flow/core').Edge | null }) {
+  const old = edges.value.find((e) => e.id === removeEdgeId)
+  if (old) removeEdges([old])
+  if (newEdge) addEdges([newEdge])
+  spreadParallelLabels()
+  hasUnsavedChanges.value = true
+}
+
 onMounted(async () => {
   loadAvailableFlows()
   await loadFlow()
@@ -797,6 +813,10 @@ onMounted(async () => {
             <span class="text-sm">{{ enabled ? $t('flowBuilder.enabled') : $t('flowBuilder.disabled') }}</span>
           </div>
 
+          <Button variant="outline" size="sm" @click="showRoutingTable = true" :disabled="edges.length === 0">
+            <Table2 class="h-4 w-4 mr-1" />
+            Routing Table
+          </Button>
           <Button variant="outline" size="sm" @click="showPreview = true" :disabled="nodes.length === 0">
             <Play class="h-4 w-4 mr-1" />
             {{ $t('flowBuilder.preview', 'Preview') }}
@@ -1016,6 +1036,14 @@ onMounted(async () => {
         </ScrollArea>
       </Card>
     </div>
+
+    <!-- Routing Table -->
+    <FlowRoutingTable
+      v-model:open="showRoutingTable"
+      :nodes="nodes"
+      :edges="edges"
+      @rewire="handleRewire"
+    />
 
     <!-- Preview overlay -->
     <Dialog v-model:open="showPreview">
