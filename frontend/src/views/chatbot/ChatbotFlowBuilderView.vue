@@ -37,6 +37,9 @@ import {
   Trash2,
   Play,
   Table2,
+  ShieldCheck,
+  Download,
+  UploadCloud,
 } from 'lucide-vue-next'
 
 import AuditLogPanel from '@/components/shared/AuditLogPanel.vue'
@@ -48,6 +51,9 @@ import ChatNodeProperties from '@/components/chatbot/ChatNodeProperties.vue'
 import PanelConfigEditor from '@/components/chatbot/PanelConfigEditor.vue'
 import type { PanelConfig, AvailableVariable } from '@/components/chatbot/PanelConfigEditor.vue'
 import FlowRoutingTable from '@/components/chatbot/FlowRoutingTable.vue'
+import FlowDiagnosticsPanel from '@/components/chatbot/FlowDiagnosticsPanel.vue'
+import { validateFlowGraph, type ValidationIssue } from '@/utils/flowValidator'
+import { exportFlowToFile, importFlowFromFile } from '@/utils/flowImportExport'
 
 import ChatbotTextNode from '@/components/chatbot/nodes/ChatbotTextNode.vue'
 import ChatbotButtonsNode from '@/components/chatbot/nodes/ChatbotButtonsNode.vue'
@@ -94,6 +100,12 @@ const showDeleteNodeConfirm = ref(false)
 const cancelDialogOpen = ref(false)
 const showPreview = ref(false)
 const showRoutingTable = ref(false)
+const showDiagnostics = ref(false)
+const diagnosticsIssues = ref<ValidationIssue[]>([])
+const diagnosticsHasRun = ref(false)
+const diagnosticsRunning = ref(false)
+const importFileRef = ref<HTMLInputElement | null>(null)
+const importConfirmOpen = ref(false)
 const auditRefreshKey = ref(0)
 const completionConfigOpen = ref(false)
 const panelConfigOpen = ref(false)
@@ -769,6 +781,115 @@ watch([name, description, enabled, triggerKeywords, initialMessage, completionMe
 })
 
 /**
+ * Export the current canvas to a .json file.
+ */
+function exportFlow() {
+  const safeName = (name.value || 'flow').replace(/[^a-z0-9_-]/gi, '_').toLowerCase()
+  exportFlowToFile(
+    nodes.value,
+    edges.value,
+    {
+      name: name.value,
+      description: description.value,
+      enabled: enabled.value,
+      triggerKeywords: triggerKeywords.value,
+      initialMessage: initialMessage.value,
+      completionMessage: completionMessage.value,
+    },
+    `${safeName}_flow_export.json`,
+  )
+  toast.success('Flow exported', { description: 'Download started — check your downloads folder.' })
+}
+
+/**
+ * Open the OS file picker (hidden <input type="file">).
+ * If the canvas already has nodes, show a confirmation first.
+ */
+function triggerImport() {
+  if (nodes.value.length > 1) {
+    // More than just the Start node — warn before overwriting
+    importConfirmOpen.value = true
+  } else {
+    importFileRef.value?.click()
+  }
+}
+
+function confirmImportOverwrite() {
+  importConfirmOpen.value = false
+  importFileRef.value?.click()
+}
+
+/**
+ * Parse the uploaded file, remap IDs, clear canvas, load new graph.
+ */
+async function handleImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file  = input.files?.[0]
+  if (!file) return
+  // Reset so the same file can be re-imported if needed
+  input.value = ''
+
+  const result = await importFlowFromFile(file)
+
+  if (!result.ok) {
+    toast.error('Import failed', { description: result.message })
+    return
+  }
+
+  // Clear existing canvas
+  if (nodes.value.length > 0) removeNodes(nodes.value.map((n) => n.id))
+  if (edges.value.length > 0) removeEdges(edges.value)
+
+  // Populate metadata from the exported bundle
+  if (result.meta.name)              name.value              = result.meta.name
+  if (result.meta.description)       description.value       = result.meta.description
+  if (result.meta.triggerKeywords)   triggerKeywords.value   = result.meta.triggerKeywords
+  if (result.meta.initialMessage)    initialMessage.value    = result.meta.initialMessage
+  if (result.meta.completionMessage) completionMessage.value = result.meta.completionMessage
+
+  // Load the new nodes/edges
+  addNodes(result.nodes)
+  addEdges(result.edges)
+  spreadParallelLabels()
+
+  // Reset diagnostics — old results are stale
+  diagnosticsHasRun.value   = false
+  diagnosticsIssues.value   = []
+
+  hasUnsavedChanges.value = true
+  selectedNodeId.value    = null
+
+  setTimeout(() => fitView({ padding: 0.2 }), 100)
+
+  toast.success('Flow imported', {
+    description: `Loaded ${result.nodes.length} nodes and ${result.edges.length} edges. Click Save Flow to commit.`,
+  })
+}
+
+/**
+ * Run the static graph linter and open the diagnostics panel.
+ */
+function runDiagnostics() {
+  showDiagnostics.value = true
+  diagnosticsRunning.value = true
+  diagnosticsHasRun.value = true
+  // Defer one tick so the dialog opens before the (synchronous) validation runs
+  setTimeout(() => {
+    diagnosticsIssues.value = validateFlowGraph(nodes.value, edges.value)
+    diagnosticsRunning.value = false
+  }, 80)
+}
+
+/**
+ * Highlight a node on the canvas when the user clicks an issue in the panel.
+ */
+function focusDiagnosticNode(nodeId: string) {
+  selectedNodeId.value = nodeId
+  // Scroll the selected node into view
+  fitView({ nodes: [nodeId], duration: 400, padding: 0.3 })
+}
+
+/**
  * Called by FlowRoutingTable when the user rewires an edge via the
  * Destination dropdown. Removes the old edge and optionally adds a new one,
  * then marks the flow dirty so Save Flow activates.
@@ -790,41 +911,95 @@ onMounted(async () => {
 <template>
   <div class="flex flex-col h-screen bg-muted/30">
     <!-- Header -->
-    <header class="border-b bg-background px-4 py-3 flex-shrink-0">
-      <div class="flex items-center gap-4">
-        <Button variant="ghost" size="icon" @click="handleCancel">
-          <ArrowLeft class="h-5 w-5" />
-        </Button>
+    <header class="border-b bg-background px-4 py-2 flex-shrink-0">
+      <div class="flex items-center justify-between gap-4">
+        <!-- Left Side: Back, Inputs & Toggle -->
+        <div class="flex items-center gap-4 min-w-0">
+          <Button variant="ghost" size="icon" @click="handleCancel" class="shrink-0">
+            <ArrowLeft class="h-5 w-5" />
+          </Button>
 
-        <div class="flex-1 flex items-center gap-6">
-          <div class="flex items-center gap-2">
-            <Label class="text-sm text-muted-foreground whitespace-nowrap">{{ $t('flowBuilder.name') }}</Label>
-            <Input v-model="name" :placeholder="$t('flowBuilder.namePlaceholder')" class="w-48 font-medium" />
-          </div>
-          <div class="flex items-center gap-2">
-            <Label class="text-sm text-muted-foreground whitespace-nowrap">{{ $t('flowBuilder.description') }}</Label>
-            <Input v-model="description" :placeholder="$t('flowBuilder.optional')" class="w-64" />
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="flex items-center gap-2">
+              <Label class="text-xs text-muted-foreground whitespace-nowrap">{{ $t('flowBuilder.name') }}</Label>
+              <Input v-model="name" :placeholder="$t('flowBuilder.namePlaceholder')" class="w-36 font-medium h-8 text-sm" />
+            </div>
+            <div class="flex items-center gap-2">
+              <Label class="text-xs text-muted-foreground whitespace-nowrap">{{ $t('flowBuilder.description') }}</Label>
+              <Input v-model="description" :placeholder="$t('flowBuilder.optional')" class="w-48 h-8 text-sm" />
+            </div>
+            
+            <!-- Enabled Switch -->
+            <div class="hidden sm:flex items-center gap-2 pl-3 ml-1 border-l h-5">
+              <Switch :checked="enabled" @update:checked="enabled = $event" id="toggle-enabled-header" />
+              <label for="toggle-enabled-header" class="text-xs text-muted-foreground font-medium whitespace-nowrap cursor-pointer select-none">
+                {{ enabled ? $t('flowBuilder.enabled') : $t('flowBuilder.disabled') }}
+              </label>
+            </div>
           </div>
         </div>
 
-        <div class="flex items-center gap-3">
-          <div class="flex items-center gap-2">
+        <!-- Right Side: Actions -->
+        <div class="flex items-center gap-2">
+          <!-- Fallback Switch for very small screens -->
+          <div class="flex sm:hidden items-center gap-1 mr-1">
             <Switch :checked="enabled" @update:checked="enabled = $event" />
-            <span class="text-sm">{{ enabled ? $t('flowBuilder.enabled') : $t('flowBuilder.disabled') }}</span>
           </div>
 
-          <Button variant="outline" size="sm" @click="showRoutingTable = true" :disabled="edges.length === 0">
-            <Table2 class="h-4 w-4 mr-1" />
-            Routing Table
+          <Button variant="outline" size="sm" class="h-8 px-2 text-xs" @click="showRoutingTable = true" :disabled="edges.length === 0" title="Routing Table">
+            <Table2 class="h-4 w-4 sm:mr-1.5" />
+            <span class="hidden sm:inline">Routing</span>
           </Button>
-          <Button variant="outline" size="sm" @click="showPreview = true" :disabled="nodes.length === 0">
-            <Play class="h-4 w-4 mr-1" />
-            {{ $t('flowBuilder.preview', 'Preview') }}
+
+          <Button variant="outline" size="sm" class="h-8 px-2 text-xs" @click="exportFlow" :disabled="nodes.length === 0" title="Export Flow">
+            <Download class="h-4 w-4 sm:mr-1.5" />
+            <span class="hidden sm:inline">Export</span>
           </Button>
-          <Button variant="outline" @click="handleCancel">{{ $t('flowBuilder.cancel') }}</Button>
-          <Button @click="saveFlow" :disabled="isSaving">
-            <Save class="h-4 w-4 mr-2" />
-            {{ isSaving ? $t('flowBuilder.saving') + '...' : $t('flowBuilder.saveFlow') }}
+
+          <Button variant="outline" size="sm" class="h-8 px-2 text-xs" @click="triggerImport" title="Import Flow">
+            <UploadCloud class="h-4 w-4 sm:mr-1.5" />
+            <span class="hidden sm:inline">Import</span>
+          </Button>
+
+          <Separator orientation="vertical" class="mx-1 h-5 hidden sm:block" />
+
+          <!-- Run Diagnostics -->
+          <Button
+            variant="outline"
+            size="sm"
+            class="relative h-8 px-2 text-xs"
+            :disabled="nodes.length === 0"
+            @click="runDiagnostics"
+            title="Run Diagnostics"
+          >
+            <ShieldCheck class="h-4 w-4 sm:mr-1.5" />
+            <span class="hidden sm:inline">Check</span>
+            <!-- Badge showing fatal+error count after a run -->
+            <span
+              v-if="diagnosticsHasRun && (diagnosticsIssues.filter(i => i.severity === 'fatal' || i.severity === 'error').length > 0)"
+              class="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center px-0.5"
+            >
+              {{ diagnosticsIssues.filter(i => i.severity === 'fatal' || i.severity === 'error').length }}
+            </span>
+            <span
+              v-else-if="diagnosticsHasRun && diagnosticsIssues.length === 0"
+              class="absolute -top-1.5 -right-1.5 w-[14px] h-[14px] rounded-full bg-green-500 border-2 border-background"
+            />
+          </Button>
+
+          <!-- Preview -->
+          <Button variant="outline" size="sm" class="h-8 px-2 text-xs" @click="showPreview = true" :disabled="nodes.length === 0" title="Preview">
+            <Play class="h-4 w-4 sm:mr-1.5" />
+            <span class="hidden sm:inline">{{ $t('flowBuilder.preview', 'Preview') }}</span>
+          </Button>
+
+          <Separator orientation="vertical" class="mx-1 h-5 hidden sm:block" />
+
+          <!-- Cancel & Save -->
+          <Button variant="ghost" size="sm" class="h-8 px-2 text-xs" @click="handleCancel">{{ $t('flowBuilder.cancel') }}</Button>
+          <Button size="sm" class="h-8 px-3 text-xs bg-green-600 hover:bg-green-700 text-white font-semibold" @click="saveFlow" :disabled="isSaving">
+            <Save class="h-4 w-4 sm:mr-1.5" />
+            <span class="hidden sm:inline">{{ isSaving ? $t('flowBuilder.saving') + '...' : $t('flowBuilder.saveFlow') }}</span>
           </Button>
         </div>
       </div>
@@ -1045,6 +1220,16 @@ onMounted(async () => {
       @rewire="handleRewire"
     />
 
+    <!-- Diagnostics Panel -->
+    <FlowDiagnosticsPanel
+      v-model:open="showDiagnostics"
+      :issues="diagnosticsIssues"
+      :is-running="diagnosticsRunning"
+      :has-run="diagnosticsHasRun"
+      @focus-node="focusDiagnosticNode"
+      @rerun="runDiagnostics"
+    />
+
     <!-- Preview overlay -->
     <Dialog v-model:open="showPreview">
       <DialogContent class="max-w-[1100px] w-[95vw] h-[92vh] p-0 flex flex-col">
@@ -1055,6 +1240,25 @@ onMounted(async () => {
         />
       </DialogContent>
     </Dialog>
+
+    <!-- Hidden file input for Import -->
+    <input
+      ref="importFileRef"
+      type="file"
+      accept=".json,application/json"
+      class="hidden"
+      @change="handleImportFile"
+    />
+
+    <!-- Import overwrite confirmation -->
+    <ConfirmDialog
+      v-model:open="importConfirmOpen"
+      title="Replace current flow?"
+      description="Importing a file will clear the current canvas. Any unsaved changes will be lost. Do you want to continue?"
+      confirm-label="Yes, Import"
+      variant="destructive"
+      @confirm="confirmImportOverwrite"
+    />
 
     <!-- Dialogs -->
     <ConfirmDialog
