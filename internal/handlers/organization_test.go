@@ -636,3 +636,87 @@ func TestApp_GetOrgCallingConfig_NonExistentOrg(t *testing.T) {
 	assert.Equal(t, 3600, maxDuration)
 	assert.Equal(t, 60, transferTimeout)
 }
+
+func TestApp_UpdateOrganizationSettings_AISettings(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	app.Config.App.EncryptionKey = "my-secure-32-character-enc-key!!"
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithEmail(testutil.UniqueEmail("ai-settings")))
+
+	// 1. Initial settings should be empty
+	reqGet := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(reqGet, org.ID, user.ID)
+	err := app.GetOrganizationSettings(reqGet)
+	require.NoError(t, err)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(reqGet))
+
+	var getResp struct {
+		Data struct {
+			Settings handlers.OrganizationSettings `json:"settings"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(reqGet), &getResp))
+	assert.Empty(t, getResp.Data.Settings.OpenRouterAPIKey)
+
+	// 2. Save settings
+	apiKey := "sk-or-v1-testkey123"
+	model := "google/gemini-pro"
+	reqPut1 := testutil.NewJSONRequest(t, map[string]any{
+		"openrouter_api_key":       apiKey,
+		"openrouter_default_model": model,
+	})
+	testutil.SetAuthContext(reqPut1, org.ID, user.ID)
+	err = app.UpdateOrganizationSettings(reqPut1)
+	require.NoError(t, err)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(reqPut1))
+
+	// 3. Verify in DB they are saved
+	var updatedOrg models.Organization
+	require.NoError(t, app.DB.Where("id = ?", org.ID).First(&updatedOrg).Error)
+	assert.Equal(t, model, updatedOrg.Settings["openrouter_default_model"])
+	assert.NotEmpty(t, updatedOrg.Settings["openrouter_api_key"])
+	assert.NotEqual(t, apiKey, updatedOrg.Settings["openrouter_api_key"]) // should be encrypted
+
+	// 4. Retrieve settings and check masking
+	reqGet2 := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(reqGet2, org.ID, user.ID)
+	err = app.GetOrganizationSettings(reqGet2)
+	require.NoError(t, err)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(reqGet2))
+
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(reqGet2), &getResp))
+	assert.Equal(t, "sk-or-v1-••••••••••••", getResp.Data.Settings.OpenRouterAPIKey)
+	assert.Equal(t, model, getResp.Data.Settings.OpenRouterDefaultModel)
+
+	// 5. Send back masked key & change model, verify key doesn't get corrupted or re-encrypted
+	newModel := "openai/gpt-4o"
+	reqPut2 := testutil.NewJSONRequest(t, map[string]any{
+		"openrouter_api_key":       "sk-or-v1-••••••••••••",
+		"openrouter_default_model": newModel,
+	})
+	testutil.SetAuthContext(reqPut2, org.ID, user.ID)
+	err = app.UpdateOrganizationSettings(reqPut2)
+	require.NoError(t, err)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(reqPut2))
+
+	var finalOrg models.Organization
+	require.NoError(t, app.DB.Where("id = ?", org.ID).First(&finalOrg).Error)
+	assert.Equal(t, newModel, finalOrg.Settings["openrouter_default_model"])
+	assert.Equal(t, updatedOrg.Settings["openrouter_api_key"], finalOrg.Settings["openrouter_api_key"]) // unchanged key
+
+	// 6. Clear key
+	reqPut3 := testutil.NewJSONRequest(t, map[string]any{
+		"openrouter_api_key": "",
+	})
+	testutil.SetAuthContext(reqPut3, org.ID, user.ID)
+	err = app.UpdateOrganizationSettings(reqPut3)
+	require.NoError(t, err)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(reqPut3))
+
+	var clearedOrg models.Organization
+	require.NoError(t, app.DB.Where("id = ?", org.ID).First(&clearedOrg).Error)
+	assert.Equal(t, "", clearedOrg.Settings["openrouter_api_key"])
+}
+

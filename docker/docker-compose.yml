@@ -1,7 +1,7 @@
 services:
   # Whatomate app
   app:
-    image: shridh0r/whatomate:latest
+    image: whatomate-local
     container_name: whatomate_app
     restart: unless-stopped
     ports:
@@ -18,7 +18,7 @@ services:
     volumes:
       - ./uploads:/app/uploads:rw
       - ../config.toml:/app/config.toml:ro
-    command: ["server", "-migrate", "-config", "/app/config.toml"]
+    command: ["./whatomate", "server", "-migrate", "-config", "/app/config.toml"]
 
   # PostgreSQL database
   db:

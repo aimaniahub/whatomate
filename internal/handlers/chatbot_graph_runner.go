@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/expr-lang/expr"
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 )
 
@@ -244,6 +246,73 @@ func (a *App) executeChatNode(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 	}
 }
 
+// sendAndSaveNodeMessage sends a text or media message based on node configuration
+func (a *App) sendAndSaveNodeMessage(
+	account *models.WhatsAppAccount,
+	contact *models.Contact,
+	session *models.ChatbotSession,
+	nodeID string,
+	text string,
+	config map[string]any,
+) error {
+	mediaType := stringFromConfig(config, "media_type")
+	if mediaType == "" || mediaType == "none" {
+		return a.sendAndSaveTextMessage(account, contact, text)
+	}
+
+	// Resolve template variables in media config
+	mediaURL := processTemplate(stringFromConfig(config, "media_url"), session.SessionData)
+	mediaID := processTemplate(stringFromConfig(config, "media_id"), session.SessionData)
+	mediaFilename := processTemplate(stringFromConfig(config, "media_filename"), session.SessionData)
+
+	if mediaURL == "" && mediaID == "" {
+		// Fallback to text message if media configs are empty
+		return a.sendAndSaveTextMessage(account, contact, text)
+	}
+
+	var msgType models.MessageType
+	switch strings.ToLower(mediaType) {
+	case "image":
+		msgType = models.MessageTypeImage
+	case "video":
+		msgType = models.MessageTypeVideo
+	case "audio":
+		msgType = models.MessageTypeAudio
+	case "document":
+		msgType = models.MessageTypeDocument
+	default:
+		return a.sendAndSaveTextMessage(account, contact, text)
+	}
+
+	// Audio messages do not support caption/body text. Send text first as a separate message.
+	if msgType == models.MessageTypeAudio && text != "" {
+		if err := a.sendAndSaveTextMessage(account, contact, text); err != nil {
+			return err
+		}
+	}
+
+	req := OutgoingMessageRequest{
+		Account:       account,
+		Contact:       contact,
+		Type:          msgType,
+		MediaFilename: mediaFilename,
+	}
+
+	if msgType != models.MessageTypeAudio {
+		req.Caption = text
+	}
+
+	if mediaID != "" {
+		req.MediaID = mediaID
+	} else {
+		req.MediaID = mediaURL
+		req.MediaURL = mediaURL
+	}
+
+	_, err := a.SendOutgoingMessage(context.Background(), req, ChatbotSendOptions())
+	return err
+}
+
 // execChatMessage sends a text message and falls through. The message
 // body is rendered with processTemplate against SessionData so authors
 // can interpolate captured variables (e.g. "Hi {{customer_name}}").
@@ -254,7 +323,7 @@ func (a *App) execChatMessage(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 		return nodeOutcome{outcome: "default"}, nil
 	}
 	text = processTemplate(text, ctx.session.SessionData)
-	if err := a.sendAndSaveTextMessage(ctx.account, ctx.contact, text); err != nil {
+	if err := a.sendAndSaveNodeMessage(ctx.account, ctx.contact, ctx.session, node.ID, text, node.Config); err != nil {
 		return nodeOutcome{}, fmt.Errorf("send message: %w", err)
 	}
 	a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, text, node.ID)
@@ -319,22 +388,17 @@ func (a *App) execChatButtons(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 func (a *App) execChatPrompt(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, error) {
 	body := stringFromConfig(node.Config, "body", "message", "text")
 
-	// No input yet → send prompt and wait.
-	if !ctx.consumed && ctx.userInput == "" {
+	// A fresh entry occurs if there's no input yet OR if the input was already
+	// consumed by an earlier blocking node in this run.
+	if (!ctx.consumed && ctx.userInput == "") || ctx.consumed {
 		if body == "" {
 			return nodeOutcome{}, fmt.Errorf("prompt node %q has no body configured", node.ID)
 		}
 		rendered := processTemplate(body, ctx.session.SessionData)
-		if err := a.sendAndSaveTextMessage(ctx.account, ctx.contact, rendered); err != nil {
+		if err := a.sendAndSaveNodeMessage(ctx.account, ctx.contact, ctx.session, node.ID, rendered, node.Config); err != nil {
 			return nodeOutcome{}, fmt.Errorf("send prompt: %w", err)
 		}
 		a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, rendered, node.ID)
-		return nodeOutcome{yield: true}, nil
-	}
-
-	if ctx.consumed {
-		// Input was already consumed by an earlier blocking node in this
-		// run — defensive guard. Treat as fresh entry.
 		return nodeOutcome{yield: true}, nil
 	}
 
@@ -417,6 +481,25 @@ func (a *App) execChatAPICall(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 	}
 	sessionData := ctx.session.SessionData
 	sessionData["phone_number"] = ctx.session.PhoneNumber
+
+	// Dynamically inject OpenRouter API key if applicable
+	urlStr := stringFromConfig(node.Config, "url")
+	if strings.Contains(urlStr, "openrouter.ai") {
+		var org models.Organization
+		if err := a.DB.Select("settings").Where("id = ?", ctx.account.OrganizationID).First(&org).Error; err == nil {
+			if keyEnc, ok := org.Settings["openrouter_api_key"].(string); ok && keyEnc != "" {
+				decrypted, err := crypto.Decrypt(keyEnc, a.Config.App.EncryptionKey)
+				if err == nil && decrypted != "" {
+					headers, _ := cfgJSONB["headers"].(map[string]any)
+					if headers == nil {
+						headers = make(map[string]any)
+						cfgJSONB["headers"] = headers
+					}
+					headers["Authorization"] = "Bearer " + decrypted
+				}
+			}
+		}
+	}
 
 	replaceVar := func(s string) string { return processTemplate(s, sessionData) }
 	respBody, statusCode, err := a.executeConfiguredAPI(cfgJSONB, replaceVar)

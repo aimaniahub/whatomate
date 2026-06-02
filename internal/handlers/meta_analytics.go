@@ -119,9 +119,14 @@ func (a *App) GetMetaAnalytics(r *fastglue.Request) error {
 		}
 	}
 
-	// Convert dates to Unix timestamps
-	startUnix := startDate.Unix()
-	endUnix := endDate.Add(24*time.Hour - time.Second).Unix() // End of day
+	// Get the current time in UTC
+	now := time.Now().UTC()
+
+	// FIX: Set the end boundary to exactly right now, not the end of the day
+	endUnix := now.Unix()
+
+	// Set the start boundary to 30 days ago relative to right now
+	startUnix := now.AddDate(0, 0, -30).Unix()
 
 	// Get accounts to query
 	var accounts []models.WhatsAppAccount

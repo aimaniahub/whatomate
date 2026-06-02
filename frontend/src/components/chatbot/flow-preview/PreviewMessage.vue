@@ -29,6 +29,31 @@ const isDebug = computed(() => props.message.type === 'debug')
         class="bg-white dark:bg-[#202c33] rounded-lg rounded-tl-none p-3 shadow-[0_1px_0.5px_rgba(0,0,0,0.13)] dark:shadow-[0_1px_0.5px_rgba(0,0,0,0.5)] ring-1 ring-black/5 dark:ring-white/5"
         :class="{ 'border-l-2 border-red-400': message.isValidationError }"
       >
+        <!-- Media Attachment Preview -->
+        <div v-if="message.mediaType && message.mediaType !== 'none'" class="mb-2 rounded overflow-hidden bg-gray-50 dark:bg-[#111b21]/50 border border-gray-100 dark:border-gray-800 flex items-center justify-center min-h-[80px]">
+          <template v-if="message.mediaType === 'image'">
+            <img v-if="message.mediaUrl" :src="message.mediaUrl" class="max-h-[160px] w-full object-cover" alt="Image attachment" />
+            <div v-else class="p-4 text-center text-xs text-gray-500">📷 Image (ID: {{ message.mediaId }})</div>
+          </template>
+          <template v-else-if="message.mediaType === 'video'">
+            <video v-if="message.mediaUrl" :src="message.mediaUrl" controls class="max-h-[160px] w-full object-cover"></video>
+            <div v-else class="p-4 text-center text-xs text-gray-500">🎥 Video (ID: {{ message.mediaId }})</div>
+          </template>
+          <template v-else-if="message.mediaType === 'audio'">
+            <audio v-if="message.mediaUrl" :src="message.mediaUrl" controls class="w-full max-w-[240px] scale-90"></audio>
+            <div v-else class="p-4 text-center text-xs text-gray-500">🎵 Audio (ID: {{ message.mediaId }})</div>
+          </template>
+          <template v-else-if="message.mediaType === 'document'">
+            <div class="p-3 w-full flex items-center gap-2 text-xs text-left">
+              <span class="text-xl">📄</span>
+              <div class="min-w-0 flex-1">
+                <p class="font-medium truncate text-gray-800 dark:text-gray-200">{{ message.mediaFilename || 'document.pdf' }}</p>
+                <p class="text-[10px] text-gray-400 truncate">{{ message.mediaUrl || `Meta ID: ${message.mediaId}` }}</p>
+              </div>
+            </div>
+          </template>
+        </div>
+
         <p class="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-wrap">
           {{ message.content }}
         </p>

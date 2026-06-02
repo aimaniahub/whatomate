@@ -45,6 +45,10 @@ export interface FlowStep {
   retry_on_invalid: boolean
   max_retries: number
   skip_condition: string
+  media_type?: string
+  media_url?: string
+  media_id?: string
+  media_filename?: string
 }
 
 export interface FlowData {
@@ -75,6 +79,10 @@ export interface SimulationMessage {
   inputConfig?: Record<string, any>
   isValidationError?: boolean
   isApiMessage?: boolean
+  mediaType?: string
+  mediaUrl?: string
+  mediaId?: string
+  mediaFilename?: string
 }
 
 export interface SimulationSnapshot {

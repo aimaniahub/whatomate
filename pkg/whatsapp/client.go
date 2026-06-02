@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/zerodha/logf"
@@ -335,7 +336,7 @@ func (c *Client) sendMediaMessage(ctx context.Context, account *Account, rcpt Re
 	rcpt.SetOnPayload(payload)
 
 	url := c.buildMessagesURL(account)
-	c.Log.Debug("Sending media message", "type", mediaType, "phone", rcpt.Phone, "media_id", mediaFields["id"])
+	c.Log.Debug("Sending media message", "type", mediaType, "phone", rcpt.Phone, "media_id", mediaFields["id"], "media_link", mediaFields["link"])
 
 	respBody, err := c.doRequest(ctx, "POST", url, payload, account.AccessToken)
 	if err != nil {
@@ -356,32 +357,48 @@ func (c *Client) sendMediaMessage(ctx context.Context, account *Account, rcpt Re
 	return messageID, nil
 }
 
-// SendImageMessage sends an image message using a media ID
+// SendImageMessage sends an image message using a media ID or URL
 func (c *Client) SendImageMessage(ctx context.Context, account *Account, rcpt Recipient, mediaID, caption string) (string, error) {
-	return c.sendMediaMessage(ctx, account, rcpt, "image", map[string]any{
-		"id": mediaID, "caption": caption,
-	})
+	fields := map[string]any{"caption": caption}
+	if strings.HasPrefix(mediaID, "http://") || strings.HasPrefix(mediaID, "https://") {
+		fields["link"] = convertGoogleDriveURL(mediaID)
+	} else {
+		fields["id"] = mediaID
+	}
+	return c.sendMediaMessage(ctx, account, rcpt, "image", fields)
 }
 
-// SendDocumentMessage sends a document message using a media ID
+// SendDocumentMessage sends a document message using a media ID or URL
 func (c *Client) SendDocumentMessage(ctx context.Context, account *Account, rcpt Recipient, mediaID, filename, caption string) (string, error) {
-	return c.sendMediaMessage(ctx, account, rcpt, "document", map[string]any{
-		"id": mediaID, "filename": filename, "caption": caption,
-	})
+	fields := map[string]any{"caption": caption, "filename": filename}
+	if strings.HasPrefix(mediaID, "http://") || strings.HasPrefix(mediaID, "https://") {
+		fields["link"] = convertGoogleDriveURL(mediaID)
+	} else {
+		fields["id"] = mediaID
+	}
+	return c.sendMediaMessage(ctx, account, rcpt, "document", fields)
 }
 
-// SendVideoMessage sends a video message using a media ID
+// SendVideoMessage sends a video message using a media ID or URL
 func (c *Client) SendVideoMessage(ctx context.Context, account *Account, rcpt Recipient, mediaID, caption string) (string, error) {
-	return c.sendMediaMessage(ctx, account, rcpt, "video", map[string]any{
-		"id": mediaID, "caption": caption,
-	})
+	fields := map[string]any{"caption": caption}
+	if strings.HasPrefix(mediaID, "http://") || strings.HasPrefix(mediaID, "https://") {
+		fields["link"] = convertGoogleDriveURL(mediaID)
+	} else {
+		fields["id"] = mediaID
+	}
+	return c.sendMediaMessage(ctx, account, rcpt, "video", fields)
 }
 
-// SendAudioMessage sends an audio message using a media ID
+// SendAudioMessage sends an audio message using a media ID or URL
 func (c *Client) SendAudioMessage(ctx context.Context, account *Account, rcpt Recipient, mediaID string) (string, error) {
-	return c.sendMediaMessage(ctx, account, rcpt, "audio", map[string]any{
-		"id": mediaID,
-	})
+	fields := map[string]any{}
+	if strings.HasPrefix(mediaID, "http://") || strings.HasPrefix(mediaID, "https://") {
+		fields["link"] = convertGoogleDriveURL(mediaID)
+	} else {
+		fields["id"] = mediaID
+	}
+	return c.sendMediaMessage(ctx, account, rcpt, "audio", fields)
 }
 
 // MarkMessageRead sends a read receipt for a message
@@ -559,4 +576,47 @@ func (c *Client) SubscribeApp(ctx context.Context, account *Account) error {
 
 	c.Log.Info("App subscribed to webhooks", "business_id", account.BusinessID)
 	return nil
+}
+
+// convertGoogleDriveURL parses Google Drive viewer/edit sharing links
+// and automatically transforms them to their direct file download endpoints
+func convertGoogleDriveURL(url string) string {
+	// e.g. https://drive.google.com/file/d/1nh1IQINhc9zt8FnDV4FUZfT5tj8/view
+	if strings.Contains(url, "drive.google.com/file/d/") {
+		parts := strings.Split(url, "drive.google.com/file/d/")
+		if len(parts) > 1 {
+			idPart := parts[1]
+			// Find the next slash or question mark to isolate the file ID
+			endIdx := strings.IndexAny(idPart, "/?")
+			if endIdx != -1 {
+				idPart = idPart[:endIdx]
+			}
+			return "https://drive.google.com/uc?export=download&id=" + idPart
+		}
+	}
+	// e.g. https://drive.google.com/open?id=1nh1IQINhc9zt8FnDV4FUZfT5tj8
+	if strings.Contains(url, "drive.google.com/open?id=") {
+		parts := strings.Split(url, "drive.google.com/open?id=")
+		if len(parts) > 1 {
+			idPart := parts[1]
+			endIdx := strings.IndexAny(idPart, "&")
+			if endIdx != -1 {
+				idPart = idPart[:endIdx]
+			}
+			return "https://drive.google.com/uc?export=download&id=" + idPart
+		}
+	}
+	// e.g. https://docs.google.com/file/d/1nh1IQINhc9zt8FnDV4FUZfT5tj8/edit
+	if strings.Contains(url, "docs.google.com/file/d/") {
+		parts := strings.Split(url, "docs.google.com/file/d/")
+		if len(parts) > 1 {
+			idPart := parts[1]
+			endIdx := strings.IndexAny(idPart, "/?")
+			if endIdx != -1 {
+				idPart = idPart[:endIdx]
+			}
+			return "https://drive.google.com/uc?export=download&id=" + idPart
+		}
+	}
+	return url
 }

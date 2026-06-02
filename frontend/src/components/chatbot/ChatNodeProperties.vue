@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import type { Edge } from '@vue-flow/core'
 import type { ChatNode } from '@/services/api'
 import { useTeamsStore } from '@/stores/teams'
 import { Input } from '@/components/ui/input'
@@ -8,17 +9,20 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { Trash2, Plus } from 'lucide-vue-next'
+import { Trash2, Plus, ArrowRight } from 'lucide-vue-next'
 
 const props = defineProps<{
   node: ChatNode
   currentFlowId?: string
   availableFlows?: { id: string; name: string }[]
+  availableNodesList?: { label: string; id: string }[]
+  edges?: Edge[]
 }>()
 
 const emit = defineEmits<{
   'update:node': [node: ChatNode]
   'delete': []
+  'update-routing': [sourceNodeId: string, sourceHandleId: string, targetNodeId: string]
 }>()
 
 const teamsStore = useTeamsStore()
@@ -250,6 +254,18 @@ const gotoFlowTargets = computed(() =>
   (props.availableFlows || []).filter((f) => f.id !== props.currentFlowId),
 )
 
+/**
+ * Returns the current routing target ID for a given source handle.
+ * Used to initialise the Go To dropdowns.
+ */
+function routingTargetFor(handleId: string): string {
+  const h = handleId || 'default'
+  const edge = (props.edges || []).find(
+    (e) => e.source === props.node.id && (e.sourceHandle ?? 'default') === h,
+  )
+  return edge?.target ?? ''
+}
+
 const typeLabel: Record<string, string> = {
   start: 'Start',
   message: 'Message',
@@ -298,6 +314,58 @@ const typeLabel: Record<string, string> = {
         />
         <p class="text-[10px] text-muted-foreground">Use double-brace placeholders (e.g. <code>customer_name</code>) to interpolate session variables.</p>
       </div>
+
+      <!-- Media Attachment -->
+      <div class="pt-2 border-t space-y-1.5">
+        <Label class="text-xs font-semibold">Media Attachment (Optional)</Label>
+        <Select :model-value="config.media_type || 'none'" @update:model-value="(v: any) => updateConfig('media_type', v)">
+          <SelectTrigger class="h-8 text-sm"><SelectValue placeholder="No media" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="none">None</SelectItem>
+            <SelectItem value="image">Image</SelectItem>
+            <SelectItem value="video">Video</SelectItem>
+            <SelectItem value="audio">Audio</SelectItem>
+            <SelectItem value="document">Document</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      <template v-if="config.media_type && config.media_type !== 'none'">
+        <div class="space-y-2 pl-2 border-l-2 border-primary/20">
+          <div class="space-y-1">
+            <Label class="text-[10px] text-muted-foreground">Media URL (Recommended)</Label>
+            <Input
+              :model-value="config.media_url || ''"
+              @update:model-value="(v: string) => updateConfig('media_url', v)"
+              placeholder="https://example.com/image.png"
+              class="h-7 text-xs font-mono"
+            />
+          </div>
+
+          <div class="space-y-1">
+            <Label class="text-[10px] text-muted-foreground">Or Meta Media ID</Label>
+            <Input
+              :model-value="config.media_id || ''"
+              @update:model-value="(v: string) => updateConfig('media_id', v)"
+              placeholder="1234567890"
+              class="h-7 text-xs font-mono"
+            />
+          </div>
+
+          <div v-if="config.media_type === 'document'" class="space-y-1">
+            <Label class="text-[10px] text-muted-foreground">Document Filename (Optional)</Label>
+            <Input
+              :model-value="config.media_filename || ''"
+              @update:model-value="(v: string) => updateConfig('media_filename', v)"
+              placeholder="invoice.pdf"
+              class="h-7 text-xs"
+            />
+          </div>
+
+          <p class="text-[9px] text-muted-foreground">You can use double-brace variables in any of the media fields above.</p>
+        </div>
+      </template>
+
       <div class="space-y-1.5">
         <Label class="text-xs">Expected response</Label>
         <Select :model-value="expectedResponse" @update:model-value="(v: any) => setExpectedResponse(v)">
@@ -415,6 +483,31 @@ const typeLabel: Record<string, string> = {
           <p v-if="!btn.id" class="text-[10px] text-destructive">
             ⚠ Button ID is empty — set it to match what WhatsApp sends back (e.g. <code>registration_hub</code>). Without it the flow cannot route after this button is pressed.
           </p>
+          <!-- Go To: per-button routing dropdown (only for reply buttons) -->
+          <div v-if="!btn.type || btn.type === 'reply'" class="space-y-0.5">
+            <Label class="text-[10px] text-muted-foreground flex items-center gap-1">
+              <ArrowRight class="h-3 w-3" /> If clicked, Go To
+            </Label>
+            <Select
+              :model-value="routingTargetFor(`button:${btn.id}`) || '__none__'"
+              :disabled="!btn.id"
+              @update:model-value="(v: any) => emit('update-routing', node.id, `button:${btn.id}`, v === '__none__' ? '' : v)"
+            >
+              <SelectTrigger class="h-7 text-xs">
+                <SelectValue placeholder="— not connected —" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none__">— Disconnect —</SelectItem>
+                <SelectItem
+                  v-for="n in (availableNodesList || []).filter(n => n.id !== node.id)"
+                  :key="n.id"
+                  :value="n.id"
+                >
+                  {{ n.label }}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
           <Input
             v-if="btn.type === 'url'"
             :model-value="btn.url || ''"
@@ -735,6 +828,35 @@ const typeLabel: Record<string, string> = {
         class="h-8 text-xs font-mono"
       />
       <p class="text-[10px] text-muted-foreground">Skip this node when the expression evaluates truthy — execution continues via the default edge.</p>
+    </div>
+
+    <!-- Go To: single outgoing default route for all non-branching, non-terminal nodes -->
+    <div
+      v-if="availableNodesList && !['start', 'buttons', 'condition', 'timing'].includes(node.type)"
+      class="pt-2 border-t space-y-1.5"
+    >
+      <Label class="text-xs flex items-center gap-1">
+        <ArrowRight class="h-3.5 w-3.5" /> Next Step (Go To)
+      </Label>
+      <Select
+        :model-value="routingTargetFor('default') || '__none__'"
+        @update:model-value="(v: any) => emit('update-routing', node.id, 'default', v === '__none__' ? '' : v)"
+      >
+        <SelectTrigger class="h-8 text-sm">
+          <SelectValue placeholder="— not connected —" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__none__">— Disconnect —</SelectItem>
+          <SelectItem
+            v-for="n in (availableNodesList || []).filter(n => n.id !== node.id)"
+            :key="n.id"
+            :value="n.id"
+          >
+            {{ n.label }}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+      <p class="text-[10px] text-muted-foreground">Select which node this step routes to. Changes take effect immediately on the canvas.</p>
     </div>
   </div>
 </template>

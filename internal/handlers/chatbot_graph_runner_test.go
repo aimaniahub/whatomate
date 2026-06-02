@@ -1368,3 +1368,99 @@ func TestRunChatGraph_Prompt_NoRegexAcceptsAnything(t *testing.T) {
 	assert.Equal(t, models.SessionStatusCompleted, session.Status)
 	assert.Equal(t, "literally anything", session.SessionData["email"])
 }
+
+// TestRunChatGraph_Message_Media verifies that a message node configured with media
+// sends a media message (with caption) instead of a plain text message.
+func TestRunChatGraph_Message_Media(t *testing.T) {
+	app, org, account, contact, session := newGraphTestFixtures(t)
+
+	flow := &models.ChatbotFlow{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		Name:            "media-flow",
+		IsEnabled:       true,
+		Graph: models.JSONB{
+			"version":    2,
+			"entry_node": "m1",
+			"nodes": []any{
+				map[string]any{
+					"id":   "m1",
+					"type": "message",
+					"config": map[string]any{
+						"message":    "Look at this image!",
+						"media_type": "image",
+						"media_url":  "https://example.com/photo.jpg",
+					},
+				},
+				map[string]any{"id": "e1", "type": "end"},
+			},
+			"edges": []any{
+				map[string]any{"from": "m1", "to": "e1", "condition": "default"},
+			},
+		},
+	}
+	require.NoError(t, app.DB.Create(flow).Error)
+
+	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
+
+	// Verify database messages
+	var msgs []models.Message
+	require.NoError(t, app.DB.Where("contact_id = ? AND direction = ?", contact.ID, models.DirectionOutgoing).Find(&msgs).Error)
+	require.Len(t, msgs, 1)
+
+	msg := msgs[0]
+	assert.Equal(t, models.MessageTypeImage, msg.MessageType)
+	assert.Equal(t, "Look at this image!", msg.Content)
+	assert.Equal(t, "https://example.com/photo.jpg", msg.MediaURL)
+}
+
+// TestRunChatGraph_Message_AudioSplit verifies that an audio media configuration with text
+// sends the text message first followed by the audio message.
+func TestRunChatGraph_Message_AudioSplit(t *testing.T) {
+	app, org, account, contact, session := newGraphTestFixtures(t)
+
+	flow := &models.ChatbotFlow{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		Name:            "audio-flow",
+		IsEnabled:       true,
+		Graph: models.JSONB{
+			"version":    2,
+			"entry_node": "m1",
+			"nodes": []any{
+				map[string]any{
+					"id":   "m1",
+					"type": "message",
+					"config": map[string]any{
+						"message":    "Listen to this!",
+						"media_type": "audio",
+						"media_url":  "https://example.com/sound.ogg",
+					},
+				},
+				map[string]any{"id": "e1", "type": "end"},
+			},
+			"edges": []any{
+				map[string]any{"from": "m1", "to": "e1", "condition": "default"},
+			},
+		},
+	}
+	require.NoError(t, app.DB.Create(flow).Error)
+
+	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
+
+	// Verify database messages: should be two outgoing messages
+	var msgs []models.Message
+	require.NoError(t, app.DB.Where("contact_id = ? AND direction = ?", contact.ID, models.DirectionOutgoing).Order("created_at asc").Find(&msgs).Error)
+	require.Len(t, msgs, 2)
+
+	// First message: Text
+	assert.Equal(t, models.MessageTypeText, msgs[0].MessageType)
+	assert.Equal(t, "Listen to this!", msgs[0].Content)
+
+	// Second message: Audio
+	assert.Equal(t, models.MessageTypeAudio, msgs[1].MessageType)
+	assert.Equal(t, "https://example.com/sound.ogg", msgs[1].MediaURL)
+	assert.Empty(t, msgs[1].Content)
+}

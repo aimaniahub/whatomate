@@ -457,7 +457,12 @@ func BuildTemplateComponents(
 	case "IMAGE", "VIDEO", "DOCUMENT":
 		if headerMediaID != "" {
 			mediaType := strings.ToLower(headerType)
-			mediaObj := map[string]any{"id": headerMediaID}
+			mediaObj := map[string]any{}
+			if strings.HasPrefix(headerMediaID, "http://") || strings.HasPrefix(headerMediaID, "https://") {
+				mediaObj["link"] = convertGoogleDriveURL(headerMediaID)
+			} else {
+				mediaObj["id"] = headerMediaID
+			}
 			if mediaType == "document" && headerMediaFilename != "" {
 				mediaObj["filename"] = headerMediaFilename
 			}

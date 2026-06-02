@@ -476,3 +476,67 @@ func (t *testServerTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	testReq.URL.Host = t.serverURL[7:] // Remove "http://"
 	return http.DefaultTransport.RoundTrip(testReq)
 }
+
+func TestClient_SendImageMessage_GoogleDrive(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		inputURL string
+		wantURL  string
+	}{
+		{
+			name:     "Google Drive sharing view link",
+			inputURL: "https://drive.google.com/file/d/1nh1IQINhc9zt8FnDV4FUZfT5tj8/view?usp=sharing",
+			wantURL:  "https://drive.google.com/uc?export=download&id=1nh1IQINhc9zt8FnDV4FUZfT5tj8",
+		},
+		{
+			name:     "Google Drive sharing open link",
+			inputURL: "https://drive.google.com/open?id=2ab234CD56&usp=drivesdk",
+			wantURL:  "https://drive.google.com/uc?export=download&id=2ab234CD56",
+		},
+		{
+			name:     "Google Docs file link",
+			inputURL: "https://docs.google.com/file/d/3ef345GH67/edit",
+			wantURL:  "https://drive.google.com/uc?export=download&id=3ef345GH67",
+		},
+		{
+			name:     "Standard URL remains unchanged",
+			inputURL: "https://images.unsplash.com/photo-1579546929518-9e396f3cc809",
+			wantURL:  "https://images.unsplash.com/photo-1579546929518-9e396f3cc809",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+
+				assert.Equal(t, "image", body["type"])
+				image := body["image"].(map[string]any)
+				assert.Equal(t, tc.wantURL, image["link"])
+
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"messages": []map[string]string{{"id": "wamid.img123"}},
+				})
+			}))
+			defer server.Close()
+
+			log := testutil.NopLogger()
+			client := whatsapp.NewWithTimeout(log, 5*time.Second)
+			client.HTTPClient = &http.Client{
+				Transport: &testServerTransport{serverURL: server.URL},
+			}
+
+			account := testAccount(server.URL)
+			ctx := testutil.TestContext(t)
+
+			msgID, err := client.SendImageMessage(ctx, account, whatsapp.Recipient{Phone: "1234567890"}, tc.inputURL, "Test Caption")
+
+			require.NoError(t, err)
+			assert.Equal(t, "wamid.img123", msgID)
+		})
+	}
+}

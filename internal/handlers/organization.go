@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/audit"
+	"github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
@@ -37,6 +38,13 @@ func callingSettingsSnapshot(settings models.JSONB) map[string]any {
 	}
 }
 
+func aiSettingsSnapshot(settings models.JSONB) map[string]any {
+	return map[string]any{
+		"openrouter_api_key":       settings["openrouter_api_key"],
+		"openrouter_default_model": settings["openrouter_default_model"],
+	}
+}
+
 // OrganizationSettings represents the settings structure
 type OrganizationSettings struct {
 	MaskPhoneNumbers    bool   `json:"mask_phone_numbers"`
@@ -47,6 +55,8 @@ type OrganizationSettings struct {
 	TransferTimeoutSecs int    `json:"transfer_timeout_secs"`
 	HoldMusicFile       string `json:"hold_music_file"`
 	RingbackFile        string `json:"ringback_file"`
+	OpenRouterAPIKey    string `json:"openrouter_api_key"`
+	OpenRouterDefaultModel string `json:"openrouter_default_model"`
 }
 
 // GetOrganizationSettings returns the organization settings
@@ -71,6 +81,7 @@ func (a *App) GetOrganizationSettings(r *fastglue.Request) error {
 		TransferTimeoutSecs: callingConfigDefault(a.Config.Calling.TransferTimeoutSecs, 60),
 		HoldMusicFile:       a.Config.Calling.HoldMusicFile,
 		RingbackFile:        a.Config.Calling.RingbackFile,
+		OpenRouterDefaultModel: "openai/gpt-4o-mini",
 	}
 
 	if org.Settings != nil {
@@ -98,6 +109,12 @@ func (a *App) GetOrganizationSettings(r *fastglue.Request) error {
 		if v, ok := org.Settings["ringback_file"].(string); ok && v != "" {
 			settings.RingbackFile = v
 		}
+		if v, ok := org.Settings["openrouter_default_model"].(string); ok && v != "" {
+			settings.OpenRouterDefaultModel = v
+		}
+		if v, ok := org.Settings["openrouter_api_key"].(string); ok && v != "" {
+			settings.OpenRouterAPIKey = "sk-or-v1-••••••••••••"
+		}
 	}
 
 	return r.SendEnvelope(map[string]any{
@@ -123,6 +140,8 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		TransferTimeoutSecs *int    `json:"transfer_timeout_secs"`
 		HoldMusicFile       *string `json:"hold_music_file"`
 		RingbackFile        *string `json:"ringback_file"`
+		OpenRouterAPIKey    *string `json:"openrouter_api_key"`
+		OpenRouterDefaultModel *string `json:"openrouter_default_model"`
 	}
 
 	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
@@ -137,15 +156,22 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 	// Snapshot before mutation so we can compute per-tab diffs.
 	oldGeneral := generalSettingsSnapshot(org.Name, org.Settings)
 	oldCalling := callingSettingsSnapshot(org.Settings)
+	oldAI := aiSettingsSnapshot(org.Settings)
 
 	// Track which tabs received updates so we only audit the relevant ones.
 	generalTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil || req.DateFormat != nil || (req.Name != nil && *req.Name != "")
 	callingTouched := req.CallingEnabled != nil || req.MaxCallDuration != nil || req.TransferTimeoutSecs != nil || req.HoldMusicFile != nil || req.RingbackFile != nil
+	aiTouched := req.OpenRouterAPIKey != nil || req.OpenRouterDefaultModel != nil
 
 	// Update settings
-	if org.Settings == nil {
-		org.Settings = models.JSONB{}
+	// Clone org.Settings to a new map so GORM's change tracker detects the change.
+	newSettings := make(models.JSONB)
+	if org.Settings != nil {
+		for k, v := range org.Settings {
+			newSettings[k] = v
+		}
 	}
+	org.Settings = newSettings
 
 	if req.MaskPhoneNumbers != nil {
 		org.Settings["mask_phone_numbers"] = *req.MaskPhoneNumbers
@@ -174,8 +200,25 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 	if req.Name != nil && *req.Name != "" {
 		org.Name = *req.Name
 	}
+	if req.OpenRouterAPIKey != nil {
+		if *req.OpenRouterAPIKey != "sk-or-v1-••••••••••••" && *req.OpenRouterAPIKey != "" {
+			enc, err := crypto.Encrypt(*req.OpenRouterAPIKey, a.Config.App.EncryptionKey)
+			if err != nil {
+				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to encrypt API key", nil, "")
+			}
+			org.Settings["openrouter_api_key"] = enc
+		} else if *req.OpenRouterAPIKey == "" {
+			org.Settings["openrouter_api_key"] = ""
+		}
+	}
+	if req.OpenRouterDefaultModel != nil {
+		org.Settings["openrouter_default_model"] = *req.OpenRouterDefaultModel
+	}
 
-	if err := a.DB.Save(&org).Error; err != nil {
+	if err := a.DB.Model(&org).Updates(map[string]interface{}{
+		"name":     org.Name,
+		"settings": org.Settings,
+	}).Error; err != nil {
 		a.Log.Error("Failed to update settings", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update settings", nil, "")
 	}
@@ -195,6 +238,11 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		newCalling := callingSettingsSnapshot(org.Settings)
 		audit.LogAudit(a.DB, orgID, userID, userName,
 			models.ResourceSettingsCalling, orgID, models.AuditActionUpdated, oldCalling, newCalling)
+	}
+	if aiTouched {
+		newAI := aiSettingsSnapshot(org.Settings)
+		audit.LogAudit(a.DB, orgID, userID, userName,
+			models.ResourceSettingsChatbotAI, orgID, models.AuditActionUpdated, oldAI, newAI)
 	}
 
 	return r.SendEnvelope(map[string]any{

@@ -292,8 +292,19 @@ export function useFlowGraphSimulation(
 
   function execMessage(node: ChatNode): string {
     const text = interpolate(stringField(node, 'message', 'text'), state.variables)
-    if (text) {
-      addMessage('bot', text, { stepName: node.id })
+    const mediaType = stringField(node, 'media_type')
+    const mediaUrl = interpolate(stringField(node, 'media_url'), state.variables)
+    const mediaId = interpolate(stringField(node, 'media_id'), state.variables)
+    const mediaFilename = interpolate(stringField(node, 'media_filename'), state.variables)
+
+    if (text || (mediaType && mediaType !== 'none')) {
+      addMessage('bot', text, {
+        stepName: node.id,
+        mediaType: mediaType || undefined,
+        mediaUrl: mediaUrl || undefined,
+        mediaId: mediaId || undefined,
+        mediaFilename: mediaFilename || undefined,
+      })
     }
     return 'default'
   }
@@ -314,7 +325,21 @@ export function useFlowGraphSimulation(
 
   function execPrompt(node: ChatNode): string {
     const body = interpolate(stringField(node, 'body', 'message', 'text'), state.variables)
-    if (body) addMessage('bot', body, { stepName: node.id, inputType: 'text' })
+    const mediaType = stringField(node, 'media_type')
+    const mediaUrl = interpolate(stringField(node, 'media_url'), state.variables)
+    const mediaId = interpolate(stringField(node, 'media_id'), state.variables)
+    const mediaFilename = interpolate(stringField(node, 'media_filename'), state.variables)
+
+    if (body || (mediaType && mediaType !== 'none')) {
+      addMessage('bot', body, {
+        stepName: node.id,
+        inputType: 'text',
+        mediaType: mediaType || undefined,
+        mediaUrl: mediaUrl || undefined,
+        mediaId: mediaId || undefined,
+        mediaFilename: mediaFilename || undefined,
+      })
+    }
     state.status = 'waiting_input'
     return '__yield__'
   }
@@ -575,11 +600,19 @@ function adaptNodeAsStep(node: ChatNode): Record<string, any> {
     message_type: messageType,
     message: stringFromConfig(cfg, 'message', 'body', 'text'),
     input_type: messageType === 'prompt' ? 'text' : 'none',
+    media_type: stringFromConfig(cfg, 'media_type'),
+    media_url: stringFromConfig(cfg, 'media_url'),
+    media_id: stringFromConfig(cfg, 'media_id'),
+    media_filename: stringFromConfig(cfg, 'media_filename'),
     buttons: (cfg.buttons as any[]) || [],
     input_config: {
       flow_cta: stringFromConfig(cfg, 'cta'),
       flow_id: stringFromConfig(cfg, 'flow_id'),
       flow_header: stringFromConfig(cfg, 'header'),
+      media_type: stringFromConfig(cfg, 'media_type'),
+      media_url: stringFromConfig(cfg, 'media_url'),
+      media_id: stringFromConfig(cfg, 'media_id'),
+      media_filename: stringFromConfig(cfg, 'media_filename'),
     },
     transfer_config: {
       team_id: stringFromConfig(cfg, 'team_id'),

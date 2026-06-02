@@ -176,6 +176,31 @@ const localListPickerOpen = computed({
                   <div class="flex justify-start">
                     <div class="max-w-[85%]">
                       <div class="bg-white dark:bg-[#202c33] rounded-lg rounded-tl-none shadow-sm p-3">
+                        <!-- Media Attachment Preview -->
+                        <div v-if="selectedStep.media_type && selectedStep.media_type !== 'none'" class="mb-2 rounded overflow-hidden bg-gray-50 dark:bg-[#111b21]/50 border border-gray-100 dark:border-gray-800 flex items-center justify-center min-h-[80px]">
+                          <template v-if="selectedStep.media_type === 'image'">
+                            <img v-if="selectedStep.media_url" :src="selectedStep.media_url" class="max-h-[160px] w-full object-cover" alt="Image attachment" />
+                            <div v-else class="p-4 text-center text-xs text-gray-500">📷 Image (ID: {{ selectedStep.media_id }})</div>
+                          </template>
+                          <template v-else-if="selectedStep.media_type === 'video'">
+                            <video v-if="selectedStep.media_url" :src="selectedStep.media_url" controls class="max-h-[160px] w-full object-cover"></video>
+                            <div v-else class="p-4 text-center text-xs text-gray-500">🎥 Video (ID: {{ selectedStep.media_id }})</div>
+                          </template>
+                          <template v-else-if="selectedStep.media_type === 'audio'">
+                            <audio v-if="selectedStep.media_url" :src="selectedStep.media_url" controls class="w-full max-w-[240px] scale-90"></audio>
+                            <div v-else class="p-4 text-center text-xs text-gray-500">🎵 Audio (ID: {{ selectedStep.media_id }})</div>
+                          </template>
+                          <template v-else-if="selectedStep.media_type === 'document'">
+                            <div class="p-3 w-full flex items-center gap-2 text-xs text-left">
+                              <span class="text-xl">📄</span>
+                              <div class="min-w-0 flex-1">
+                                <p class="font-medium truncate text-gray-800 dark:text-gray-200">{{ selectedStep.media_filename || 'document.pdf' }}</p>
+                                <p class="text-[10px] text-gray-400 truncate">{{ selectedStep.media_url || `Meta ID: ${selectedStep.media_id}` }}</p>
+                              </div>
+                            </div>
+                          </template>
+                        </div>
+
                         <p v-if="selectedStep.message" class="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-wrap">{{ selectedStep.message }}</p>
                         <p v-else class="text-sm text-gray-400 italic">No message configured</p>
                         <p class="text-[10px] text-gray-400 text-right mt-1">12:00 PM</p>

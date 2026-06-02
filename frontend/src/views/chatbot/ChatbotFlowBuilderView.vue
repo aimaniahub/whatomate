@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, markRaw, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
-import { useVueFlow, MarkerType, type NodeMouseEvent, type Edge, type EdgeMouseEvent, type Connection } from '@vue-flow/core'
+import { useVueFlow, MarkerType, type NodeMouseEvent, type Edge, type EdgeMouseEvent } from '@vue-flow/core'
 import { toast } from 'vue-sonner'
 
 import FlowCanvas from '@/components/shared/FlowCanvas.vue'
@@ -110,6 +110,9 @@ const auditRefreshKey = ref(0)
 const completionConfigOpen = ref(false)
 const panelConfigOpen = ref(false)
 const activityOpen = ref(false)
+const showAiCopilot = ref(false)
+const isAiLoading = ref(false)
+const aiPrompt = ref('')
 
 const createdAt = ref('')
 const updatedAt = ref('')
@@ -345,20 +348,6 @@ function onEdgeClick({ edge }: EdgeMouseEvent) {
   selectedNodeId.value = null
 }
 
-function onEdgeUpdate({ edge, connection }: { edge: Edge; connection: Connection }) {
-  removeEdges([edge])
-  addEdges([
-    {
-      ...connection,
-      type: 'default',
-      animated: true,
-      markerEnd: MarkerType.ArrowClosed,
-      label: connection.sourceHandle || 'default',
-    },
-  ])
-  spreadParallelLabels()
-  hasUnsavedChanges.value = true
-}
 
 function onUpdateNode(updated: ChatNode) {
   const node = nodes.value.find((n) => n.id === updated.id)
@@ -405,17 +394,21 @@ function onUpdateNode(updated: ChatNode) {
 
     // Step 1: patch renamed-button edges
     if (idRenames.size > 0) {
-      edges.value.forEach((edge) => {
-        if (edge.source !== node.id) return
+      edges.value = edges.value.map((edge) => {
+        if (edge.source !== node.id) return edge
         const sh = edge.sourceHandle ?? ''
-        if (!sh.startsWith('button:')) return
+        if (!sh.startsWith('button:')) return edge
         const oldId = sh.slice('button:'.length)
-        if (!idRenames.has(oldId)) return
+        if (!idRenames.has(oldId)) return edge
+        
         const newId = idRenames.get(oldId)!
         const newHandle = `button:${newId}`
-        edge.sourceHandle = newHandle
-        // Edge label mirrors the condition so the canvas stays readable
-        edge.label = newHandle
+        
+        return {
+          ...edge,
+          sourceHandle: newHandle,
+          label: newHandle
+        }
       })
     }
 
@@ -526,6 +519,15 @@ const previewGraph = computed<ChatFlowGraph | null>(() => {
   if (nodes.value.length === 0) return null
   return toGraphPayload()
 })
+
+// Task 2: Computed list of all canvas nodes for the right-panel "Go To" dropdowns.
+// Format: { label, id } for friendly display + real ID for edge construction.
+const availableNodesList = computed<{ label: string; id: string }[]>(() =>
+  nodes.value.map((n) => ({
+    label: (n.data?.label as string) || n.type || n.id,
+    id: n.id,
+  }))
+)
 
 function loadGraph(graph: ChatFlowGraph) {
   // Legacy graphs (saved before the start sentinel landed) may have an
@@ -902,10 +904,234 @@ function handleRewire({ removeEdgeId, newEdge }: { removeEdgeId: string; newEdge
   hasUnsavedChanges.value = true
 }
 
+/**
+ * Task 4: Programmatic edge auto-generation.
+ * Called from the right-panel "Go To" dropdowns in ChatNodeProperties.
+ *
+ * - If targetNodeId is empty, only removes the existing edge (disconnect).
+ * - Removes any existing edge from sourceNodeId via sourceHandleId first.
+ * - Then pushes a new edge with the correct sourceHandle and label.
+ * - For standard nodes: sourceHandleId should be "default".
+ * - For button nodes: sourceHandleId should be "button:<btn_id>".
+ */
+function updateNodeRouting(sourceNodeId: string, sourceHandleId: string, targetNodeId: string) {
+  // Remove any existing edge for this exact source + handle
+  const existingEdges = edges.value.filter(
+    (e) => e.source === sourceNodeId && (e.sourceHandle ?? 'default') === (sourceHandleId || 'default'),
+  )
+  if (existingEdges.length > 0) removeEdges(existingEdges)
+
+  // If no target selected, just disconnect and stop.
+  if (!targetNodeId) {
+    hasUnsavedChanges.value = true
+    return
+  }
+
+  const handle = sourceHandleId || 'default'
+  const edgeId = `edge_${sourceNodeId}_${handle}_${Date.now()}`
+  addEdges([{
+    id: edgeId,
+    source: sourceNodeId,
+    target: targetNodeId,
+    sourceHandle: handle,
+    type: 'default',
+    animated: true,
+    markerEnd: MarkerType.ArrowClosed,
+    label: handle !== 'default' ? handle : '',
+    style: { strokeWidth: 4 },
+  }])
+  spreadParallelLabels()
+  hasUnsavedChanges.value = true
+}
+
 onMounted(async () => {
   loadAvailableFlows()
   await loadFlow()
 })
+function stripGraphForAi(currentNodes: any[], currentEdges: any[]) {
+  const strippedNodes = currentNodes.map(n => ({
+    id: n.id,
+    type: n.type,
+    data: { config: n.data?.config }
+  }))
+  const strippedEdges = currentEdges.map(e => ({
+    id: e.id,
+    source: e.source,
+    target: e.target,
+    sourceHandle: e.sourceHandle
+  }))
+  return { nodes: strippedNodes, edges: strippedEdges }
+}
+
+function applyAiGraphUpdates(aiNodes: any[], aiEdges: any[]) {
+  // Ensure inputs are arrays
+  const safeAiNodes = Array.isArray(aiNodes) ? aiNodes : []
+  const safeAiEdges = Array.isArray(aiEdges) ? aiEdges : []
+
+  // Complete graph detection: if the AI output contains the 'start' node type
+  const isCompleteGraph = safeAiNodes.some(n => n.type === 'start')
+
+  const currentNodesMap = new Map(nodes.value.map(n => [n.id, n]))
+  const aiNodesMap = new Map(safeAiNodes.map(n => [n.id, n]))
+
+  let updatedNodes: any[] = []
+
+  if (isCompleteGraph) {
+    // Overwrite-with-merge strategy
+    updatedNodes = safeAiNodes.map(aiNode => {
+      const existing = currentNodesMap.get(aiNode.id)
+      if (existing) {
+        // Merge the AI config into existing config to preserve other parameters
+        const mergedConfig = { ...(existing.data?.config || {}), ...(aiNode.data?.config || {}) }
+        return {
+          ...existing,
+          type: aiNode.type || existing.type,
+          data: {
+            ...existing.data,
+            config: mergedConfig,
+            label: mergedConfig.body || existing.data?.label || 'Node'
+          }
+        }
+      } else {
+        // Brand new node
+        return {
+          id: aiNode.id,
+          type: aiNode.type || 'message',
+          position: { x: Math.random() * 200 + 100, y: Math.random() * 200 + 100 },
+          data: {
+            label: aiNode.data?.config?.body || 'New Node',
+            config: aiNode.data?.config || {}
+          },
+          selected: false,
+          deletable: aiNode.type !== 'start'
+        }
+      }
+    })
+  } else {
+    // Partial graph: keep all existing nodes, update/merge those modified, add new ones
+    updatedNodes = [...nodes.value]
+
+    // Update existing nodes modified by AI
+    updatedNodes = updatedNodes.map(existing => {
+      const aiNode = aiNodesMap.get(existing.id)
+      if (aiNode) {
+        const mergedConfig = { ...(existing.data?.config || {}), ...(aiNode.data?.config || {}) }
+        return {
+          ...existing,
+          type: aiNode.type || existing.type,
+          data: {
+            ...existing.data,
+            config: mergedConfig,
+            label: mergedConfig.body || existing.data?.label || 'Node'
+          }
+        }
+      }
+      return existing
+    })
+
+    // Add brand new nodes
+    safeAiNodes.forEach(aiNode => {
+      if (!currentNodesMap.has(aiNode.id)) {
+        updatedNodes.push({
+          id: aiNode.id,
+          type: aiNode.type || 'message',
+          position: { x: Math.random() * 200 + 100, y: Math.random() * 200 + 100 },
+          data: {
+            label: aiNode.data?.config?.body || 'New Node',
+            config: aiNode.data?.config || {}
+          },
+          selected: false,
+          deletable: aiNode.type !== 'start'
+        })
+      }
+    })
+  }
+
+  // Edge handling
+  let updatedEdges: any[] = []
+
+  if (isCompleteGraph) {
+    // Complete graph: overwrite with new edges
+    updatedEdges = safeAiEdges.map(e => ({
+      id: e.id || `edge-${e.source}-${e.target}`,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle || null,
+      type: 'default',
+      animated: true,
+      markerEnd: MarkerType.ArrowClosed,
+      style: { strokeWidth: 4 }
+    }))
+  } else {
+    // Partial update: merge new/modified edges, handle rewiring
+    updatedEdges = [...edges.value]
+
+    safeAiEdges.forEach(aiEdge => {
+      // Find index of edge by id or by source/sourceHandle combination (rewiring)
+      const existingIdx = updatedEdges.findIndex(e =>
+        e.id === aiEdge.id ||
+        (e.source === aiEdge.source && (e.sourceHandle || null) === (aiEdge.sourceHandle || null))
+      )
+
+      const newEdgeObj = {
+        id: aiEdge.id || `edge-${aiEdge.source}-${aiEdge.target}-${Date.now()}`,
+        source: aiEdge.source,
+        target: aiEdge.target,
+        sourceHandle: aiEdge.sourceHandle || null,
+        type: 'default',
+        animated: true,
+        markerEnd: MarkerType.ArrowClosed,
+        style: { strokeWidth: 4 }
+      }
+
+      if (existingIdx > -1) {
+        // Replace it
+        updatedEdges[existingIdx] = newEdgeObj
+      } else {
+        // Add it
+        updatedEdges.push(newEdgeObj)
+      }
+    })
+  }
+
+  nodes.value = updatedNodes
+  edges.value = updatedEdges
+  hasUnsavedChanges.value = true
+}
+
+async function runAiEdit() {
+  if (!aiPrompt.value.trim()) return
+  
+  isAiLoading.value = true
+  try {
+    const { nodes: strippedNodes, edges: strippedEdges } = stripGraphForAi(nodes.value, edges.value)
+    
+    const response = await chatbotService.aiEdit({
+      prompt: aiPrompt.value,
+      nodes: strippedNodes,
+      edges: strippedEdges
+    })
+    
+    const result = response.data?.data || response.data
+    
+    if (result && result.error) {
+      toast.error(`AI Edit Error: ${result.error}`)
+      console.warn('Raw AI Content:', result.raw_content)
+    } else if (result && result.nodes && result.edges) {
+      applyAiGraphUpdates(result.nodes, result.edges)
+      toast.success('AI updated the graph. Please review and save.')
+      showAiCopilot.value = false
+      aiPrompt.value = ''
+    } else {
+      toast.error('AI response was invalid.')
+    }
+  } catch (err: any) {
+    console.error('AI Edit Error:', err)
+    toast.error(err.response?.data?.message || 'Failed to run AI Edit')
+  } finally {
+    isAiLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -962,6 +1188,11 @@ onMounted(async () => {
           </Button>
 
           <Separator orientation="vertical" class="mx-1 h-5 hidden sm:block" />
+
+          <!-- AI Copilot -->
+          <Button variant="outline" size="sm" class="h-8 px-2 text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200" @click="showAiCopilot = true" title="AI Copilot">
+            <span class="font-semibold">✨ AI Copilot</span>
+          </Button>
 
           <!-- Run Diagnostics -->
           <Button
@@ -1026,6 +1257,29 @@ onMounted(async () => {
     <div class="flex-1 flex overflow-hidden">
       <!-- Canvas -->
       <div class="flex-1 relative">
+        <!-- AI Copilot Panel -->
+        <div v-if="showAiCopilot" class="absolute top-4 left-4 z-20 w-80 bg-background border rounded-lg shadow-lg flex flex-col">
+          <div class="flex items-center justify-between p-3 border-b bg-muted/50 rounded-t-lg">
+            <div class="flex items-center gap-2">
+              <span class="text-lg">✨</span>
+              <h3 class="font-semibold text-sm">AI Copilot</h3>
+            </div>
+            <Button variant="ghost" size="sm" class="h-6 px-2 text-xs" @click="showAiCopilot = false">
+              Close
+            </Button>
+          </div>
+          <div class="p-3 flex flex-col gap-3">
+            <Textarea v-model="aiPrompt" placeholder="e.g., Add a text node asking for an email after the start node" class="min-h-[80px] text-sm resize-none" :disabled="isAiLoading" />
+            <Button size="sm" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white" @click="runAiEdit" :disabled="isAiLoading || !aiPrompt.trim()">
+              <span v-if="isAiLoading" class="flex items-center gap-2">
+                <div class="animate-spin rounded-full h-3 w-3 border-b-2 border-white" />
+                Thinking...
+              </span>
+              <span v-else>Run AI Edit</span>
+            </Button>
+          </div>
+        </div>
+
         <div v-if="isLoading" class="absolute inset-0 flex items-center justify-center bg-background/80 z-10">
           <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-primary" />
         </div>
@@ -1052,7 +1306,6 @@ onMounted(async () => {
           @node-click="onNodeClick"
           @pane-click="onPaneClick"
           @edge-click="onEdgeClick"
-          @edge-update="onEdgeUpdate"
           @node-drag-stop="onNodeDragStop"
         />
       </div>
@@ -1065,8 +1318,11 @@ onMounted(async () => {
             :node="selectedChatNode"
             :current-flow-id="flowId"
             :available-flows="availableFlows"
+            :available-nodes-list="availableNodesList"
+            :edges="edges"
             @update:node="onUpdateNode"
             @delete="requestDeleteSelectedNode"
+            @update-routing="(src, handle, tgt) => updateNodeRouting(src, handle, tgt)"
           />
         </div>
 

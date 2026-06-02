@@ -363,6 +363,7 @@ export const chatbotService = {
   createFlow: (data: any) => api.post('/chatbot/flows', data),
   updateFlow: (id: string, data: any) => api.put(`/chatbot/flows/${id}`, data),
   deleteFlow: (id: string) => api.delete(`/chatbot/flows/${id}`),
+  aiEdit: (data: { prompt: string, nodes: any[], edges: any[] }) => api.post('/flow/ai-edit', data),
 
   // AI Contexts
   listAIContexts: (params?: { search?: string; page?: number; limit?: number }) =>
@@ -686,6 +687,8 @@ export const organizationService = {
     transfer_timeout_secs?: number
     hold_music_file?: string
     ringback_file?: string
+    openrouter_api_key?: string
+    openrouter_default_model?: string
   }) => api.put('/org/settings', data),
   uploadOrgAudio: (file: File, type: 'hold_music' | 'ringback') => {
     const formData = new FormData()

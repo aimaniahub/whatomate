@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { PageHeader, AuditLogPanel } from '@/components/shared'
 import LanguageSwitcher from '@/components/LanguageSwitcher.vue'
 import { toast } from 'vue-sonner'
-import { Settings, Bell, Loader2, Globe, Phone, Upload, Play, Pause, Music } from 'lucide-vue-next'
+import { Settings, Bell, Loader2, Globe, Phone, Upload, Play, Pause, Music, Bot } from 'lucide-vue-next'
 import { usersService, organizationService } from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
 
@@ -56,6 +56,12 @@ const callingSettings = ref({
   ringback_file: ''
 })
 
+// AI Settings
+const aiSettings = ref({
+  openrouter_api_key: '',
+  openrouter_default_model: 'openai/gpt-4o-mini'
+})
+
 const isUploadingHoldMusic = ref(false)
 const isUploadingRingback = ref(false)
 const holdMusicInput = ref<HTMLInputElement | null>(null)
@@ -71,6 +77,7 @@ const playingRingback = ref(false)
 const generalLogKey = ref(0)
 const notificationLogKey = ref(0)
 const callingLogKey = ref(0)
+const aiLogKey = ref(0)
 
 function refreshActivityLog(key: typeof generalLogKey) {
   setTimeout(() => { key.value++ }, 500)
@@ -98,6 +105,10 @@ onMounted(async () => {
         transfer_timeout_secs: orgData.settings?.transfer_timeout_secs || 120,
         hold_music_file: orgData.settings?.hold_music_file || '',
         ringback_file: orgData.settings?.ringback_file || ''
+      }
+      aiSettings.value = {
+        openrouter_api_key: orgData.settings?.openrouter_api_key || '',
+        openrouter_default_model: orgData.settings?.openrouter_default_model || 'openai/gpt-4o-mini'
       }
     }
 
@@ -130,6 +141,22 @@ async function saveGeneralSettings() {
     refreshActivityLog(generalLogKey)
   } catch (error) {
     toast.error(t('common.failedSave', { resource: t('resources.settings') }))
+  } finally {
+    isSubmitting.value = false
+  }
+}
+
+async function saveAISettings() {
+  isSubmitting.value = true
+  try {
+    await organizationService.updateSettings({
+      openrouter_api_key: aiSettings.value.openrouter_api_key,
+      openrouter_default_model: aiSettings.value.openrouter_default_model
+    })
+    toast.success('AI Integration settings updated successfully')
+    refreshActivityLog(aiLogKey)
+  } catch (error) {
+    toast.error('Failed to update AI Integration settings')
   } finally {
     isSubmitting.value = false
   }
@@ -222,7 +249,7 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
     <ScrollArea class="flex-1">
       <div class="p-6 space-y-4 max-w-4xl mx-auto">
         <Tabs default-value="general" class="w-full">
-          <TabsList class="grid w-full grid-cols-3 mb-6 bg-white/[0.04] border border-white/[0.08] light:bg-gray-100 light:border-gray-200">
+          <TabsList class="grid w-full grid-cols-4 mb-6 bg-white/[0.04] border border-white/[0.08] light:bg-gray-100 light:border-gray-200">
             <TabsTrigger value="general" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
               <Settings class="h-4 w-4 mr-2" />
               {{ $t('settings.general') }}
@@ -234,6 +261,10 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
             <TabsTrigger value="calling" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
               <Phone class="h-4 w-4 mr-2" />
               {{ $t('settings.calling') }}
+            </TabsTrigger>
+            <TabsTrigger value="ai" class="data-[state=active]:bg-white/[0.08] data-[state=active]:text-white text-white/50 light:data-[state=active]:bg-white light:data-[state=active]:text-gray-900 light:text-gray-500">
+              <Bot class="h-4 w-4 mr-2" />
+              AI Integration
             </TabsTrigger>
           </TabsList>
 
@@ -312,6 +343,42 @@ function togglePlayAudio(type: 'hold_music' | 'ringback') {
             </div>
             <div v-if="orgID" class="mt-4">
               <AuditLogPanel :key="generalLogKey" resource-type="settings.general" :resource-id="orgID" />
+            </div>
+          </TabsContent>
+
+          <!-- AI Integration Tab -->
+          <TabsContent value="ai">
+            <div class="rounded-xl border border-white/[0.08] bg-white/[0.02] light:bg-white light:border-gray-200">
+              <div class="p-6 pb-3">
+                <h3 class="text-lg font-semibold text-white light:text-gray-900">AI Integration</h3>
+                <p class="text-sm text-white/40 light:text-gray-500">Configure your global AI provider settings for chatbot flows.</p>
+              </div>
+              <div class="p-6 pt-3 space-y-4">
+                <div class="space-y-2">
+                  <Label for="openrouter_api_key" class="text-white/70 light:text-gray-700">OpenRouter API Key</Label>
+                  <Input
+                    id="openrouter_api_key"
+                    type="password"
+                    v-model="aiSettings.openrouter_api_key"
+                    placeholder="sk-or-v1-..."
+                  />
+                  <p class="text-xs text-white/40 light:text-gray-500">If set, this key will automatically authorize requests to OpenRouter.ai in your API call nodes.</p>
+                </div>
+                <div class="space-y-2">
+                  <Label for="openrouter_default_model" class="text-white/70 light:text-gray-700">Default Model</Label>
+                  <Input id="openrouter_default_model" v-model="aiSettings.openrouter_default_model" placeholder="e.g. openai/gpt-4o-mini" class="bg-white/[0.04] border-white/[0.1] text-white placeholder:text-white/30 light:bg-white light:border-gray-200 light:text-gray-900" />
+                  <p class="text-xs text-white/40 light:text-gray-500">Enter the exact model ID from OpenRouter (e.g. anthropic/claude-3.5-sonnet).</p>
+                </div>
+                <div class="flex justify-end">
+                  <Button variant="outline" size="sm" class="bg-white/[0.04] border-white/[0.1] text-white/70 hover:bg-white/[0.08] hover:text-white light:bg-white light:border-gray-200 light:text-gray-700 light:hover:bg-gray-50" @click="saveAISettings" :disabled="isSubmitting">
+                    <Loader2 v-if="isSubmitting" class="mr-2 h-4 w-4 animate-spin" />
+                    {{ $t('settings.save') }}
+                  </Button>
+                </div>
+              </div>
+            </div>
+            <div v-if="orgID" class="mt-4">
+              <AuditLogPanel :key="aiLogKey" resource-type="settings.chatbot.ai" :resource-id="orgID" />
             </div>
           </TabsContent>
 
