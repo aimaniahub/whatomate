@@ -1061,13 +1061,13 @@ func (a *App) DeleteChatbotFlow(r *fastglue.Request) error {
 	var flowForAudit models.ChatbotFlow
 	a.DB.Where("id = ? AND organization_id = ?", id, orgID).First(&flowForAudit)
 
-	// Delete flow and steps in transaction
-	tx := a.DB.Begin()
-
-	// Delete steps first (legacy, don't block if it fails)
-	if err := tx.Where("flow_id = ?", id).Delete(&models.ChatbotFlowStep{}).Error; err != nil {
+	// Delete steps first (legacy, outside transaction so it doesn't poison tx if it fails)
+	if err := a.DB.Exec("DELETE FROM chatbot_flow_steps WHERE flow_id = ?", id).Error; err != nil {
 		a.Log.Warn("Failed to delete flow steps (legacy), continuing", "error", err)
 	}
+
+	// Delete flow in transaction
+	tx := a.DB.Begin()
 
 	// Delete flow
 	result := tx.Where("id = ? AND organization_id = ?", id, orgID).Delete(&models.ChatbotFlow{})

@@ -214,10 +214,24 @@ func getNestedValue(data map[string]any, path string) any {
 				return nil
 			}
 		} else {
-			// Regular field access
+			// Regular field access OR numeric array index in dot notation (e.g. choices.0)
 			switch v := current.(type) {
 			case map[string]any:
 				current = v[part]
+			case []any:
+				idx, err := strconv.Atoi(part)
+				if err == nil && idx >= 0 && idx < len(v) {
+					current = v[idx]
+				} else {
+					return nil
+				}
+			case []map[string]any:
+				idx, err := strconv.Atoi(part)
+				if err == nil && idx >= 0 && idx < len(v) {
+					current = v[idx]
+				} else {
+					return nil
+				}
 			default:
 				return nil
 			}

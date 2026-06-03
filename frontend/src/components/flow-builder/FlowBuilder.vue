@@ -80,14 +80,33 @@ const emit = defineEmits<{
   'update:modelValue': [value: { screens: FlowScreen[] }]
 }>()
 
-const screens = ref<FlowScreen[]>(props.modelValue?.screens || [])
+const screens = ref<FlowScreen[]>(
+  (props.modelValue?.screens || []).map(screen => ({
+    ...screen,
+    layout: {
+      type: screen.layout?.type || 'SingleColumnLayout',
+      children: screen.layout?.children || []
+    }
+  }))
+)
 const selectedScreenIndex = ref<number>(0)
 const selectedComponentIndex = ref<number | null>(null)
 
 // Watch for external changes
 watch(() => props.modelValue, (newVal) => {
   if (newVal?.screens) {
-    screens.value = newVal.screens
+    const sanitizedScreens = newVal.screens.map(screen => ({
+      ...screen,
+      layout: {
+        type: screen.layout?.type || 'SingleColumnLayout',
+        children: screen.layout?.children || []
+      }
+    }))
+    const newJSON = JSON.stringify(sanitizedScreens)
+    const currentJSON = JSON.stringify(screens.value)
+    if (newJSON !== currentJSON) {
+      screens.value = sanitizedScreens
+    }
   }
 }, { deep: true })
 

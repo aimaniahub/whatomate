@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -372,7 +374,11 @@ func (c *Client) SendImageMessage(ctx context.Context, account *Account, rcpt Re
 func (c *Client) SendDocumentMessage(ctx context.Context, account *Account, rcpt Recipient, mediaID, filename, caption string) (string, error) {
 	fields := map[string]any{"caption": caption, "filename": filename}
 	if strings.HasPrefix(mediaID, "http://") || strings.HasPrefix(mediaID, "https://") {
-		fields["link"] = convertGoogleDriveURL(mediaID)
+		resolvedLink := convertGoogleDriveURL(mediaID)
+		fields["link"] = resolvedLink
+		if filename == "" {
+			fields["filename"] = c.resolveFilenameFromURL(resolvedLink)
+		}
 	} else {
 		fields["id"] = mediaID
 	}
@@ -620,3 +626,83 @@ func convertGoogleDriveURL(url string) string {
 	}
 	return url
 }
+
+// resolveFilenameFromURL attempts to fetch the headers of a URL to extract the filename and extension
+func (c *Client) resolveFilenameFromURL(mediaURL string) string {
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	// Try HEAD first
+	req, err := http.NewRequest("HEAD", mediaURL, nil)
+	if err == nil {
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if filename := extractFilenameFromResponse(resp); filename != "" {
+				c.Log.Info("Resolved filename from URL HEAD request", "url", mediaURL, "filename", filename)
+				return filename
+			}
+		}
+	}
+
+	// Try GET (since some servers disable HEAD)
+	req, err = http.NewRequest("GET", mediaURL, nil)
+	if err == nil {
+		req.Header.Set("Range", "bytes=0-0")
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if filename := extractFilenameFromResponse(resp); filename != "" {
+				c.Log.Info("Resolved filename from URL GET range request", "url", mediaURL, "filename", filename)
+				return filename
+			}
+		}
+	}
+
+	// Fallback to parsing the URL path
+	u, err := url.Parse(mediaURL)
+	if err == nil {
+		path := u.Path
+		segments := strings.Split(path, "/")
+		for i := len(segments) - 1; i >= 0; i-- {
+			if segments[i] != "" {
+				if segments[i] != "uc" && segments[i] != "download" && segments[i] != "file" {
+					c.Log.Info("Parsed filename from URL path", "url", mediaURL, "filename", segments[i])
+					return segments[i]
+				}
+				break
+			}
+		}
+	}
+
+	c.Log.Info("Using fallback filename for URL", "url", mediaURL, "filename", "document.pdf")
+	return "document.pdf"
+}
+
+func extractFilenameFromResponse(resp *http.Response) string {
+	// 1. Try Content-Disposition
+	cd := resp.Header.Get("Content-Disposition")
+	if cd != "" {
+		_, params, err := mime.ParseMediaType(cd)
+		if err == nil {
+			if filename, ok := params["filename"]; ok && filename != "" {
+				return filename
+			}
+		}
+	}
+
+	// 2. Try Content-Type to guess extension
+	ct := resp.Header.Get("Content-Type")
+	if ct != "" {
+		mediaType, _, err := mime.ParseMediaType(ct)
+		if err == nil {
+			exts, err := mime.ExtensionsByType(mediaType)
+			if err == nil && len(exts) > 0 {
+				return "document" + exts[0]
+			}
+		}
+	}
+	return ""
+}
+

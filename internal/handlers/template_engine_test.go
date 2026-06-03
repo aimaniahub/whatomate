@@ -365,6 +365,20 @@ func TestGetNestedValue_MapSliceIndex(t *testing.T) {
 	assert.Equal(t, 1, m["id"])
 }
 
+func TestGetNestedValue_NumericDotNotationArrayIndex(t *testing.T) {
+	t.Parallel()
+	data := map[string]any{
+		"choices": []any{
+			map[string]any{
+				"message": map[string]any{
+					"content": "DeepSeek response content",
+				},
+			},
+		},
+	}
+	assert.Equal(t, "DeepSeek response content", getNestedValue(data, "choices.0.message.content"))
+}
+
 // --- splitPath ---
 
 func TestSplitPath_Simple(t *testing.T) {
