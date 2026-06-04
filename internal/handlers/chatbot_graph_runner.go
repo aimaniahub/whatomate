@@ -425,6 +425,15 @@ func (a *App) execChatPrompt(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, err
 			ctx.session.SessionData = models.JSONB{}
 		}
 		ctx.session.SessionData[storeAs] = input
+
+		// Persist entered name to the contact's profile name in the database
+		if storeAs == "contact_name" && ctx.contact != nil {
+			if err := a.DB.Model(&models.Contact{}).Where("id = ?", ctx.contact.ID).Update("profile_name", input).Error; err != nil {
+				a.Log.Error("Failed to update contact profile_name from chatbot prompt", "contact_id", ctx.contact.ID, "error", err)
+			} else {
+				ctx.contact.ProfileName = input
+			}
+		}
 	}
 	ctx.session.StepRetries = 0
 	return nodeOutcome{outcome: "default"}, nil
