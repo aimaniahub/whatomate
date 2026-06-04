@@ -97,7 +97,9 @@ func (a *App) runChatGraph(
 	}
 	session.SessionData["phone_number"] = session.PhoneNumber
 	if contact != nil {
-		session.SessionData["contact_name"] = contact.ProfileName
+		if name, ok := session.SessionData["contact_name"].(string); !ok || name == "" {
+			session.SessionData["contact_name"] = contact.ProfileName
+		}
 	}
 
 	if session.CurrentStep == "" {
