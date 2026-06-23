@@ -420,6 +420,101 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 			a.exitFlow(session)
 			return
 		}
+
+		// Dynamic Buttons Node Breakout / Fallback logic:
+		// If the user typed free text (buttonID is empty) at a buttons node, we try to:
+		// 1. Check if the message matches another flow trigger keyword.
+		// 2. Check if the message matches a keyword rule (non-transfer).
+		// 3. Fallback to AI if configured, answer the query, and re-send the buttons.
+		if buttonID == "" {
+			graph, err := parseChatGraph(flow.Graph)
+			if err == nil && graph != nil {
+				node := graph.getNode(session.CurrentStep)
+				if node != nil && node.Type == ChatNodeButtons {
+					// 1. Try to match trigger keywords for a different flow
+					if nextFlow := a.matchFlowTrigger(account.OrganizationID, messageText); nextFlow != nil && nextFlow.ID != flow.ID {
+						a.Log.Info("Active buttons node breakout to different flow", "from_flow", flow.Name, "to_flow", nextFlow.Name)
+						session.CurrentFlowID = &nextFlow.ID
+						session.CurrentStep = ""
+						session.StepRetries = 0
+						session.SessionData = models.JSONB{
+							"_flow_id":   nextFlow.ID.String(),
+							"_flow_name": nextFlow.Name,
+						}
+						if err := a.runChatGraph(account, contact, session, nextFlow, messageText, buttonID, flowResponseData); err != nil {
+							a.Log.Error("Chat graph runner failed at flow start", "error", err, "session", session.ID, "flow", nextFlow.ID)
+						}
+						return
+					}
+
+					// 2. Try to match non-transfer keyword rules
+					if keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
+						a.Log.Info("Active buttons node breakout to keyword rule", "response", keywordResponse.Body)
+						if len(keywordResponse.Buttons) > 0 {
+							if err := a.sendAndSaveInteractiveButtons(account, contact, keywordResponse.Body, keywordResponse.Buttons); err != nil {
+								a.Log.Error("Failed to send breakout keyword buttons", "error", err)
+							}
+						} else {
+							if err := a.sendAndSaveTextMessage(account, contact, keywordResponse.Body); err != nil {
+								a.Log.Error("Failed to send breakout keyword text", "error", err)
+							}
+						}
+						a.logSessionMessage(session.ID, models.DirectionOutgoing, keywordResponse.Body, "keyword_response")
+
+						// Re-send the current buttons node menu so they are not stuck
+						bodyText := stringFromConfig(node.Config, "body", "message", "text")
+						if bodyText == "" {
+							bodyText = node.Label
+						}
+						bodyText = processTemplate(bodyText, session.SessionData)
+						btnList := buttonsFromConfig(node.Config)
+						for _, b := range btnList {
+							for _, key := range []string{"title", "url", "phone_number"} {
+								if s, ok := b[key].(string); ok && s != "" {
+									b[key] = processTemplate(s, session.SessionData)
+								}
+							}
+						}
+						if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
+							a.Log.Error("Failed to re-send buttons menu after keyword breakout", "error", err)
+						}
+						return
+					}
+
+					// 3. Fallback to AI if enabled
+					if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+						a.Log.Info("Active buttons node fallback to AI", "text", messageText)
+						aiResponse, err := a.generateAIResponse(settings, session, messageText)
+						if err == nil && aiResponse != "" {
+							if err := a.sendAndSaveTextMessage(account, contact, aiResponse); err != nil {
+								a.Log.Error("Failed to send fallback AI response", "error", err)
+							}
+							a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
+
+							// Re-send the current buttons node menu so they are not stuck
+							bodyText := stringFromConfig(node.Config, "body", "message", "text")
+							if bodyText == "" {
+								bodyText = node.Label
+							}
+							bodyText = processTemplate(bodyText, session.SessionData)
+							btnList := buttonsFromConfig(node.Config)
+							for _, b := range btnList {
+								for _, key := range []string{"title", "url", "phone_number"} {
+									if s, ok := b[key].(string); ok && s != "" {
+										b[key] = processTemplate(s, session.SessionData)
+									}
+								}
+							}
+							if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
+								a.Log.Error("Failed to re-send buttons menu after AI fallback", "error", err)
+							}
+							return
+						}
+					}
+				}
+			}
+		}
+
 		if err := a.runChatGraph(account, contact, session, flow, messageText, buttonID, flowResponseData); err != nil {
 			a.Log.Error("Chat graph runner failed", "error", err, "session", session.ID, "flow", flow.ID)
 		}
@@ -447,6 +542,37 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 
 	// Send greeting message for new sessions (only if no flow was triggered)
 	if isNewSession && settings.DefaultResponse != "" {
+		// If it's NOT a simple greeting (e.g., they asked a question immediately),
+		// try to generate an AI answer first so they get their question answered.
+		if !isSimpleGreeting(messageText) {
+			answered := false
+			// Try keyword rule first
+			if keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
+				a.Log.Info("New session non-greeting matched keyword", "response", keywordResponse.Body)
+				if len(keywordResponse.Buttons) > 0 {
+					if err := a.sendAndSaveInteractiveButtons(account, contact, keywordResponse.Body, keywordResponse.Buttons); err == nil {
+						a.logSessionMessage(session.ID, models.DirectionOutgoing, keywordResponse.Body, "keyword_response")
+						answered = true
+					}
+				} else {
+					if err := a.sendAndSaveTextMessage(account, contact, keywordResponse.Body); err == nil {
+						a.logSessionMessage(session.ID, models.DirectionOutgoing, keywordResponse.Body, "keyword_response")
+						answered = true
+					}
+				}
+			}
+			// If not answered by keyword, try AI
+			if !answered && settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+				a.Log.Info("New session non-greeting attempting AI response", "text", messageText)
+				aiResponse, err := a.generateAIResponse(settings, session, messageText)
+				if err == nil && aiResponse != "" {
+					if err := a.sendAndSaveTextMessage(account, contact, aiResponse); err == nil {
+						a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
+					}
+				}
+			}
+		}
+
 		a.Log.Info("New session - sending greeting message", "contact", contact.PhoneNumber)
 		if len(settings.GreetingButtons) > 0 {
 			greetingButtons := make([]map[string]any, 0)
@@ -964,6 +1090,8 @@ func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *mode
 		return a.generateAnthropicResponse(settings, session, userMessage, contextData)
 	case models.AIProviderGoogle:
 		return a.generateGoogleResponse(settings, session, userMessage, contextData)
+	case models.AIProviderOpenRouter:
+		return a.generateOpenRouterResponse(settings, session, userMessage, contextData)
 	default:
 		return "", fmt.Errorf("unsupported AI provider: %s", settings.AI.Provider)
 	}
@@ -1384,6 +1512,116 @@ func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *
 	return "", fmt.Errorf("no response from Google AI")
 }
 
+// generateOpenRouterResponse generates a response using OpenRouter API
+func (a *App) generateOpenRouterResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
+	url := "https://openrouter.ai/api/v1/chat/completions"
+
+	// Build messages array
+	messages := []map[string]string{}
+
+	// Build system prompt with context
+	systemPrompt := settings.AI.SystemPrompt
+	if contextData != "" {
+		if systemPrompt != "" {
+			systemPrompt = systemPrompt + "\n\n" + contextData
+		} else {
+			systemPrompt = contextData
+		}
+	}
+
+	// Add system prompt if configured
+	if systemPrompt != "" {
+		messages = append(messages, map[string]string{
+			"role":    "system",
+			"content": systemPrompt,
+		})
+	}
+
+	// Add conversation history if enabled
+	if settings.AI.IncludeHistory && session != nil {
+		history := a.getSessionHistory(session.ID, settings.AI.HistoryLimit)
+		for _, msg := range history {
+			role := "user"
+			if msg.Direction == models.DirectionOutgoing {
+				role = "assistant"
+			}
+			messages = append(messages, map[string]string{
+				"role":    role,
+				"content": msg.Message,
+			})
+		}
+	}
+
+	// Add current user message
+	messages = append(messages, map[string]string{
+		"role":    "user",
+		"content": userMessage,
+	})
+
+	payload := map[string]any{
+		"model":      settings.AI.Model,
+		"messages":   messages,
+		"max_tokens": settings.AI.MaxTokens,
+	}
+
+	if settings.AI.Temperature > 0 {
+		payload["temperature"] = settings.AI.Temperature
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+settings.AI.APIKey)
+	req.Header.Set("HTTP-Referer", "https://whatomate.com")
+	req.Header.Set("X-Title", "Whatomate")
+
+	resp, err := a.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 {
+		var errResp struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &errResp)
+		if errResp.Error.Message != "" {
+			return "", fmt.Errorf("OpenRouter API error: %s", errResp.Error.Message)
+		}
+		return "", fmt.Errorf("OpenRouter API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if len(result.Choices) > 0 {
+		return strings.TrimSpace(result.Choices[0].Message.Content), nil
+	}
+
+	return "", fmt.Errorf("no response from OpenRouter")
+}
+
 // getSessionHistory retrieves recent messages from the session
 func (a *App) getSessionHistory(sessionID uuid.UUID, limit int) []models.ChatbotSessionMessage {
 	var messages []models.ChatbotSessionMessage
@@ -1648,5 +1886,30 @@ func (a *App) isWithinBusinessHours(businessHours models.JSONBArray) bool {
 
 	// If no matching day found, assume outside business hours
 	return false
+}
+
+// isSimpleGreeting checks if a message is a simple, common greeting
+func isSimpleGreeting(msg string) bool {
+	m := strings.TrimSpace(strings.ToLower(msg))
+	if len(m) > 12 {
+		return false
+	}
+	greetings := map[string]bool{
+		"hi":          true,
+		"hello":       true,
+		"hey":         true,
+		"hello there": true,
+		"hi there":    true,
+		"hola":        true,
+		"start":       true,
+		"menu":        true,
+		"get started": true,
+		"hihi":        true,
+		"hii":         true,
+		"hiii":        true,
+		"helo":        true,
+		"namaste":     true,
+	}
+	return greetings[m]
 }
 

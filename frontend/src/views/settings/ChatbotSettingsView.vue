@@ -138,7 +138,8 @@ const isAIEnabled = ref(false)
 const aiProviders = [
   { value: 'openai', label: 'OpenAI', models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'] },
   { value: 'anthropic', label: 'Anthropic', models: ['claude-3-5-sonnet-latest', 'claude-3-5-haiku-latest', 'claude-3-opus-latest'] },
-  { value: 'google', label: 'Google AI', models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash', 'gemini-1.5-flash-8b'] }
+  { value: 'google', label: 'Google AI', models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash', 'gemini-1.5-flash-8b'] },
+  { value: 'openrouter', label: 'OpenRouter', models: ['nvidia/nemotron-3-nano-30b-a3b:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'meta-llama/llama-3-8b-instruct:free', 'google/gemini-2.0-flash-exp:free'] }
 ]
 
 const availableModels = computed(() => {
@@ -918,16 +919,27 @@ function removeEscalationUser(userId: string) {
                     </div>
                     <div class="space-y-2">
                       <Label>{{ $t('chatbotSettings.model') }}</Label>
-                      <Select v-model="aiSettings.ai_model" :disabled="!aiSettings.ai_provider">
-                        <SelectTrigger>
-                          <SelectValue :placeholder="$t('chatbotSettings.selectModel') + '...'" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem v-for="model in availableModels" :key="model" :value="model">
-                            {{ model }}
-                          </SelectItem>
-                        </SelectContent>
-                      </Select>
+                      <template v-if="aiSettings.ai_provider === 'openrouter'">
+                        <Input
+                          v-model="aiSettings.ai_model"
+                          placeholder="e.g., nvidia/nemotron-3-nano-30b-a3b:free"
+                        />
+                        <p class="text-xs text-muted-foreground">
+                          Enter any OpenRouter model identifier (e.g., <code>nvidia/nemotron-3-nano-30b-a3b:free</code>).
+                        </p>
+                      </template>
+                      <template v-else>
+                        <Select v-model="aiSettings.ai_model" :disabled="!aiSettings.ai_provider">
+                          <SelectTrigger>
+                            <SelectValue :placeholder="$t('chatbotSettings.selectModel') + '...'" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem v-for="model in availableModels" :key="model" :value="model">
+                              {{ model }}
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </template>
                     </div>
                   </div>
 

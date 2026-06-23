@@ -60,3 +60,9 @@ test-results/
 
 # Docker 
 docker/.env
+
+# Local flow exports & references
+*.json
+*.pdf
+*.txt
+

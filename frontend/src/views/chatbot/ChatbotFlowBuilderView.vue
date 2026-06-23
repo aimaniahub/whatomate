@@ -40,6 +40,7 @@ import {
   ShieldCheck,
   Download,
   UploadCloud,
+  Sparkles,
 } from 'lucide-vue-next'
 
 import AuditLogPanel from '@/components/shared/AuditLogPanel.vue'
@@ -138,6 +139,7 @@ const nodeTypes: any = {
   goto_flow: markRaw(ChatbotGotoFlowNode),
   end: markRaw(ChatbotEndNode),
   webhook: markRaw(ChatbotApiNode),
+  ai_response: markRaw(ChatbotTextNode),
 }
 
 // Palette: 'prompt' and 'webhook' are internal-only — a Text node
@@ -145,6 +147,7 @@ const nodeTypes: any = {
 const palette: { type: ChatNodeType; label: string; icon: any; color: string }[] = [
   { type: 'message', label: 'Text', icon: MessageSquare, color: 'bg-blue-600' },
   { type: 'buttons', label: 'Buttons', icon: MousePointerClick, color: 'bg-purple-600' },
+  { type: 'ai_response', label: 'AI Response', icon: Sparkles, color: 'bg-orange-500' },
   { type: 'api_call', label: 'API', icon: Globe, color: 'bg-orange-600' },
   { type: 'whatsapp_flow', label: 'WA Flow', icon: MessageCircle, color: 'bg-green-600' },
   { type: 'transfer', label: 'Transfer', icon: Users, color: 'bg-amber-600' },
@@ -237,6 +240,8 @@ function defaultConfigFor(type: ChatNodeType): Record<string, any> {
       return { url: '', method: 'POST', headers: {}, body: '' }
     case 'end':
       return { message: '' }
+    case 'ai_response':
+      return { prompt_template: '{{ai_query}}' }
     default:
       return {}
   }
@@ -246,6 +251,7 @@ const paletteLabels: Record<string, string> = {
   message: 'Message',
   prompt: 'Prompt',
   buttons: 'Buttons',
+  ai_response: 'AI Response',
   api_call: 'API',
   whatsapp_flow: 'WhatsApp Flow',
   transfer: 'Transfer',

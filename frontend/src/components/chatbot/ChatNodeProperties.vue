@@ -808,6 +808,22 @@ const typeLabel: Record<string, string> = {
       </div>
     </template>
 
+    <!-- ai_response -->
+    <template v-if="node.type === 'ai_response'">
+      <div class="space-y-1.5">
+        <Label class="text-xs">Prompt Template</Label>
+        <Textarea
+          :model-value="config.prompt_template || config.prompt || ''"
+          @update:model-value="(v: string) => { updateConfig('prompt_template', v); updateConfig('prompt', v); }"
+          placeholder="e.g., {{ai_query}}"
+          class="min-h-[100px] text-xs font-mono"
+        />
+        <p class="text-[10px] text-muted-foreground">
+          Enter the template containing variables (e.g., <code v-pre>{{ai_query}}</code>) to send to the AI provider.
+        </p>
+      </div>
+    </template>
+
     <!-- Skip condition. Evaluated by the runner before executing the
          node; truthy → fall through via the default edge without
          sending anything.

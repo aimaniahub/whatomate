@@ -214,6 +214,12 @@ func RunMigrationWithProgress(db *gorm.DB, adminCfg *config.DefaultAdminConfig) 
 		return err
 	}
 
+	// Seed Darvi Group plant price list and location details
+	if err := SeedDarviGroupContext(silentDB); err != nil {
+		fmt.Printf("\n  \033[31m✗ Failed to seed Darvi Group AI context\033[0m\n\n")
+		return err
+	}
+
 	printProgress(currentStep, totalSteps)
 	fmt.Printf("\n  \033[32m✓ Migration completed\033[0m\n\n")
 
@@ -742,4 +748,123 @@ func SeedDefaultWidgetsForOrg(db *gorm.DB, orgID, userID uuid.UUID) error {
 	}
 
 	return nil
+}
+
+// SeedDarviGroupContext seeds the Darvi Group AI context (plants list and location)
+func SeedDarviGroupContext(db *gorm.DB) error {
+	// Find any organization (usually "Default Organization" or similar)
+	var org models.Organization
+	if err := db.First(&org).Error; err != nil {
+		// No organization exists yet, skip
+		return nil
+	}
+
+	// Check if the context already exists
+	var count int64
+	db.Model(&models.AIContext{}).Where("organization_id = ? AND name = ?", org.ID, "Darvi Plants and Price List").Count(&count)
+	if count > 0 {
+		return nil // Already seeded
+	}
+
+	staticContent := `Horticulture & Forestry Plants Price List - 2024
+1. Horticultural Crops:
+- Guava (Royl green) - Rs. 60
+- Guava (L-49) - Rs. 50
+- Guava (Taiwan pink) - Rs. 50
+- Guava (Taiwan white) - Rs. 60
+- Guava (Arka kiran) - Rs. 60
+- Guava (Alhabad safed) - Rs. 60
+- Guava (G-vilas) - Rs. 60
+- Guava (VNR) - Rs. 120
+- Custard Apple (NMK1 Gold) - Rs. 70
+- Custard Apple (Balanagar) - Price varies
+- Lemon (Khagazi Small) - Rs. 80 / 120
+- Lemon (Balaji) - Rs. 80 / 120
+- Lemon (Tai lemon) - Rs. 120
+- Mango (Alpanso) - Rs. 200
+- Mango (Mallika) - Rs. 200
+- Mango (Kesar) - Rs. 200
+- Mango (Badami) - Rs. 200
+- Mango (Miyazaki) - Rs. 1000
+- Ramphal - Rs. 150
+- Lakshmanphal - Rs. 150
+- Butter fruit (Grafted Green) - Rs. 200
+- Butter fruit (Grafted Hass) - Rs. 800
+- Butter fruit (Non-grafted Green) - Rs. 150
+- Jamun (Badoli) - Rs. 150
+- Jamun / Mixed (G-1) - Rs. 150
+- Amla / Mixed (Godavari) - Rs. 120
+- Amla / Mixed (Local) - Rs. 50
+- Sapota (Grafted) - Rs. 150
+- Sapota (Cricket ball) - Rs. 150
+- Sapota (Kalapatti) - Rs. 150
+- Mosambi (Rangapuri) - Rs. 150
+- Orange (Nagapur) - Rs. 150
+- Dragon fruit (Red) - Rs. 65
+- Dragon fruit (White) - Rs. 60
+- Mixed Crops Group* (Maleshian sweet) - Rs. 150
+- Mixed Crops Group* (Red) - Rs. 150
+- Mixed Crops Group* (Local) - Rs. 80
+- Coconut (Kerala dwarf green) - Rs. 290
+- Coconut (Cylon yellow) - Rs. 290
+- Coconut (Orange Dwarf) - Rs. 290
+- Coconut (Ganga Bondam TxD) - Rs. 390
+- Coconut (Tipatur Tall Local) - Rs. 180
+- Arecanut (Channagiri) - Rs. 60
+- Arecanut (Sagara) - Rs. 50
+- Arecanut (Sirsi, Siddapura) - Rs. 40
+- Anjur (Fig) (Turky red, Ballari, puna) - Rs. 80
+- Appleber (Green and red) - Rs. 120
+- Dates (Imported Tissue cultured yellow/red) - Rs. 4500
+- Jack fruit (Gumless) - Rs. 250
+- Jack fruit (Siddu) - Rs. 550
+- Jack fruit (Pink) - Rs. 250
+- Curry leaves (Suhasini) - Rs. 50
+- Curry leaves (Local) - Rs. 40
+- Drumstick (Bhagya KDM1, PKM1, PKM2) - Rs. 25
+- Rambhutan - Rs. 300
+- Lichee - Rs. 300
+- Apple (Anna, Harman 99) - Rs. 250
+- Star fruit - Rs. 150
+- Water apple / Pear (White and red) - Price varies
+- Peach - Rs. 250
+- Cherry - Rs. 200
+
+2. Forestry Plants:
+- Sandalwood (Santalum album) - Rs. 40
+- Red sandalwood (Pterocarpus santalinus) - Rs. 50
+- Rosewood (Dalbergia sissoo) - Rs. 50
+- Agarwood (Aquilaria malaccensis) - Rs. 50
+- Black wood (Dalbergia melanoxylon) - Rs. 350
+- Indian Mahogany (Swietenia mahagoni) - Rs. 40
+- African Mahogany (Khaya anthotheca / Khaya senegalensis) - Rs. 40
+- Teak (Tectona grandis) - Rs. 40
+- Teak - (TC) (Burma) - Price varies
+- Tulda bamboo (TC) - Price varies
+- Balcooa bamboo (TC) (Bambusa balcooa) - Rs. 80
+- Burma bamboo (TC) (Dendrocalamus giganteus) - Rs. 80
+- Golden bamboo (TC) (Phyllostachys aurea) - Rs. 80
+- Galimara (TC) (Casuarina equisetifolia) - Rs. 25
+- Silver oak (Grevillea robusta) - Rs. 40
+
+Darvi Group Office Address & Location Details:
+- Address: Darvi Group Office, Bengaluru, Karnataka, India
+- Contact Number: Please contact our customer support for specific location queries
+- Google Maps Link: https://maps.google.com/?q=Darvi+Group+Bengaluru
+`
+
+	aiCtx := models.AIContext{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: "", // empty for org-level
+		Name:            "Darvi Plants and Price List",
+		IsEnabled:       true,
+		Priority:        1,
+		ContextType:     models.ContextTypeStatic,
+		TriggerKeywords: models.StringArray{"plant", "price", "sandalwood", "guava", "coconut", "arecanut", "cost", "location", "address", "bengaluru", "nursery"},
+		StaticContent:   staticContent,
+		ApiConfig:       models.JSONB{},
+	}
+
+	return db.Create(&aiCtx).Error
 }
