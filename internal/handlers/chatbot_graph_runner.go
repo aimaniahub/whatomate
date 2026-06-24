@@ -100,6 +100,11 @@ func (a *App) runChatGraph(
 		if name, ok := session.SessionData["contact_name"].(string); !ok || name == "" {
 			session.SessionData["contact_name"] = contact.ProfileName
 		}
+		session.SessionData["whatsapp_name"] = contact.ProfileName
+		session.SessionData["whatsapp_phone"] = session.PhoneNumber
+	} else {
+		session.SessionData["whatsapp_name"] = ""
+		session.SessionData["whatsapp_phone"] = session.PhoneNumber
 	}
 
 	if session.CurrentStep == "" {
@@ -427,13 +432,14 @@ func (a *App) execChatPrompt(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, err
 		ctx.session.SessionData[storeAs] = input
 
 		// Persist entered name to the contact's profile name in the database
-		if storeAs == "contact_name" && ctx.contact != nil {
-			if err := a.DB.Model(&models.Contact{}).Where("id = ?", ctx.contact.ID).Update("profile_name", input).Error; err != nil {
-				a.Log.Error("Failed to update contact profile_name from chatbot prompt", "contact_id", ctx.contact.ID, "error", err)
-			} else {
-				ctx.contact.ProfileName = input
-			}
-		}
+		// NOTE: Disabled to collect name only from WhatsApp profile metadata (consistent tables)
+		// if storeAs == "contact_name" && ctx.contact != nil {
+		// 	if err := a.DB.Model(&models.Contact{}).Where("id = ?", ctx.contact.ID).Update("profile_name", input).Error; err != nil {
+		// 		a.Log.Error("Failed to update contact profile_name from chatbot prompt", "contact_id", ctx.contact.ID, "error", err)
+		// 	} else {
+		// 		ctx.contact.ProfileName = input
+		// 	}
+		// }
 	}
 	ctx.session.StepRetries = 0
 	return nodeOutcome{outcome: "default"}, nil

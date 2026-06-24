@@ -1464,3 +1464,47 @@ func TestRunChatGraph_Message_AudioSplit(t *testing.T) {
 	assert.Equal(t, "https://example.com/sound.ogg", msgs[1].MediaURL)
 	assert.Empty(t, msgs[1].Content)
 }
+
+func TestRunChatGraph_WhatsAppMetadataVariables(t *testing.T) {
+	app, org, account, contact, session := newGraphTestFixtures(t)
+
+	// Set a known profile name and phone number on the contact
+	contact.ProfileName = "Test WhatsApp User"
+	contact.PhoneNumber = "919999999999"
+	require.NoError(t, app.DB.Save(contact).Error)
+
+	session.PhoneNumber = "919999999999"
+	require.NoError(t, app.DB.Save(session).Error)
+
+	flow := &models.ChatbotFlow{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		Name:            "meta_vars",
+		IsEnabled:       true,
+		Graph: models.JSONB{
+			"version":    2,
+			"entry_node": "m1",
+			"nodes": []any{
+				map[string]any{
+					"id": "m1", "type": "message", "label": "greet",
+					"config": map[string]any{"message": "Hello {{whatsapp_name}} at {{whatsapp_phone}}!"},
+				},
+			},
+			"edges": []any{},
+		},
+	}
+	require.NoError(t, app.DB.Create(flow).Error)
+
+	require.NoError(t, app.runChatGraph(account, contact, session, flow, "start", "", nil))
+
+	require.NoError(t, app.DB.First(session, session.ID).Error)
+	assert.Equal(t, "Test WhatsApp User", session.SessionData["whatsapp_name"])
+	assert.Equal(t, "919999999999", session.SessionData["whatsapp_phone"])
+
+	// Verify database messages: should contain the resolved variables
+	var msgs []models.Message
+	require.NoError(t, app.DB.Where("contact_id = ? AND direction = ?", contact.ID, models.DirectionOutgoing).Order("created_at asc").Find(&msgs).Error)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "Hello Test WhatsApp User at 919999999999!", msgs[0].Content)
+}
