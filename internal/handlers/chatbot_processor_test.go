@@ -744,3 +744,61 @@ func TestMatchFlowTrigger_Match(t *testing.T) {
 // evaluateExpression (package-level, not on App)
 // =============================================================================
 
+func TestIsContactOrLocationQuery(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"where is your office?", true},
+		{"contact us please", true},
+		{"what is the address?", true},
+		{"send me the maps link", true},
+		{"i live in Bengaluru", true},
+		{"how to grow sandalwood?", false},
+		{"is coconut plant available", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			assert.Equal(t, tc.expected, isContactOrLocationQuery(tc.input))
+		})
+	}
+}
+
+func TestCleanAIResponse(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			"with think tags",
+			"<think>this is a chain of thought reasoning</think>Actual output response text",
+			"Actual output response text",
+		},
+		{
+			"with thought tags",
+			"<thought>reasoning process</thought>Hello world!",
+			"Hello world!",
+		},
+		{
+			"mixed multiline think tags",
+			"<think>\nfirst line of reasoning\nsecond line\n</think>\n\nPremium sandalwood varieties.",
+			"Premium sandalwood varieties.",
+		},
+		{
+			"no tags",
+			"Just normal text answer.",
+			"Just normal text answer.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, cleanAIResponse(tc.input))
+		})
+	}
+}
+
+
+

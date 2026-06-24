@@ -481,6 +481,35 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 						return
 					}
 
+					// Intercept contact query to bypass AI
+					if isContactOrLocationQuery(messageText) {
+						a.Log.Info("Active buttons node contact bypass triggered", "text", messageText)
+						contactCard := getContactCardText()
+						if err := a.sendAndSaveTextMessage(account, contact, contactCard); err != nil {
+							a.Log.Error("Failed to send contact bypass message", "error", err)
+						}
+						a.logSessionMessage(session.ID, models.DirectionOutgoing, contactCard, "contact_bypass")
+
+						// Re-send the current buttons node menu so they are not stuck
+						bodyText := stringFromConfig(node.Config, "body", "message", "text")
+						if bodyText == "" {
+							bodyText = node.Label
+						}
+						bodyText = processTemplate(bodyText, session.SessionData)
+						btnList := buttonsFromConfig(node.Config)
+						for _, b := range btnList {
+							for _, key := range []string{"title", "url", "phone_number"} {
+								if s, ok := b[key].(string); ok && s != "" {
+									b[key] = processTemplate(s, session.SessionData)
+								}
+							}
+						}
+						if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
+							a.Log.Error("Failed to re-send buttons menu after contact bypass", "error", err)
+						}
+						return
+					}
+
 					// 3. Fallback to AI if enabled
 					if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
 						a.Log.Info("Active buttons node fallback to AI", "text", messageText)
@@ -546,8 +575,17 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		// try to generate an AI answer first so they get their question answered.
 		if !isSimpleGreeting(messageText) {
 			answered := false
+			// Intercept contact query to bypass AI
+			if isContactOrLocationQuery(messageText) {
+				a.Log.Info("New session contact bypass triggered", "text", messageText)
+				contactCard := getContactCardText()
+				if err := a.sendAndSaveTextMessage(account, contact, contactCard); err == nil {
+					a.logSessionMessage(session.ID, models.DirectionOutgoing, contactCard, "contact_bypass")
+					answered = true
+				}
+			}
 			// Try keyword rule first
-			if keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
+			if !answered && keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
 				a.Log.Info("New session non-greeting matched keyword", "response", keywordResponse.Body)
 				if len(keywordResponse.Buttons) > 0 {
 					if err := a.sendAndSaveInteractiveButtons(account, contact, keywordResponse.Body, keywordResponse.Buttons); err == nil {
@@ -574,26 +612,8 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		}
 
 		a.Log.Info("New session - sending greeting message", "contact", contact.PhoneNumber)
-		if len(settings.GreetingButtons) > 0 {
-			greetingButtons := make([]map[string]any, 0)
-			for _, btn := range settings.GreetingButtons {
-				if btnMap, ok := btn.(map[string]any); ok {
-					greetingButtons = append(greetingButtons, btnMap)
-				}
-			}
-			if len(greetingButtons) > 0 {
-				if err := a.sendAndSaveInteractiveButtons(account, contact, settings.DefaultResponse, greetingButtons); err != nil {
-					a.Log.Error("Failed to send greeting buttons", "error", err, "contact", contact.PhoneNumber)
-				}
-			} else {
-				if err := a.sendAndSaveTextMessage(account, contact, settings.DefaultResponse); err != nil {
-					a.Log.Error("Failed to send greeting message", "error", err, "contact", contact.PhoneNumber)
-				}
-			}
-		} else {
-			if err := a.sendAndSaveTextMessage(account, contact, settings.DefaultResponse); err != nil {
-				a.Log.Error("Failed to send greeting message", "error", err, "contact", contact.PhoneNumber)
-			}
+		if err := a.sendGreetingMenu(account, contact, settings); err != nil {
+			a.Log.Error("Failed to send greeting menu", "error", err, "contact", contact.PhoneNumber)
 		}
 		a.logSessionMessage(session.ID, models.DirectionOutgoing, settings.DefaultResponse, "greeting")
 		return // After greeting, don't process further for new sessions
@@ -618,6 +638,22 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		return
 	}
 
+	// Intercept contact query to bypass AI in global flow
+	if isContactOrLocationQuery(messageText) {
+		a.Log.Info("Global flow contact bypass triggered", "text", messageText)
+		contactCard := getContactCardText()
+		if err := a.sendAndSaveTextMessage(account, contact, contactCard); err != nil {
+			a.Log.Error("Failed to send contact bypass message", "error", err)
+		}
+		a.logSessionMessage(session.ID, models.DirectionOutgoing, contactCard, "contact_bypass")
+
+		// Re-send the greeting menu buttons
+		if err := a.sendGreetingMenu(account, contact, settings); err != nil {
+			a.Log.Error("Failed to send greeting menu after contact bypass", "error", err)
+		}
+		return
+	}
+
 	// If no keyword matched, try AI response if enabled
 	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
 		a.Log.Info("Attempting AI response", "provider", settings.AI.Provider, "model", settings.AI.Model)
@@ -631,6 +667,11 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 				a.Log.Error("Failed to send AI response", "error", err, "contact", contact.PhoneNumber)
 			}
 			a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
+
+			// Re-send the greeting menu buttons so users can navigate
+			if err := a.sendGreetingMenu(account, contact, settings); err != nil {
+				a.Log.Error("Failed to send greeting menu after AI response", "error", err)
+			}
 			return
 		} else {
 			a.Log.Warn("AI returned empty response")
@@ -1083,18 +1124,40 @@ func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *mode
 	// Build context from AIContext entries
 	contextData := a.buildAIContext(settings.OrganizationID, session, userMessage)
 
+	var answer string
+	var err error
+
 	switch settings.AI.Provider {
 	case models.AIProviderOpenAI:
-		return a.generateOpenAIResponse(settings, session, userMessage, contextData)
+		answer, err = a.generateOpenAIResponse(settings, session, userMessage, contextData)
 	case models.AIProviderAnthropic:
-		return a.generateAnthropicResponse(settings, session, userMessage, contextData)
+		answer, err = a.generateAnthropicResponse(settings, session, userMessage, contextData)
 	case models.AIProviderGoogle:
-		return a.generateGoogleResponse(settings, session, userMessage, contextData)
+		answer, err = a.generateGoogleResponse(settings, session, userMessage, contextData)
 	case models.AIProviderOpenRouter:
-		return a.generateOpenRouterResponse(settings, session, userMessage, contextData)
+		answer, err = a.generateOpenRouterResponse(settings, session, userMessage, contextData)
 	default:
 		return "", fmt.Errorf("unsupported AI provider: %s", settings.AI.Provider)
 	}
+
+	if err != nil {
+		return "", err
+	}
+
+	return cleanAIResponse(answer), nil
+}
+
+// cleanAIResponse cleans the AI response content by stripping reasoning/thinking blocks
+func cleanAIResponse(text string) string {
+	// Strip <think>...</think> tags if they exist (standard for thinking models)
+	reThink := regexp.MustCompile(`(?s)<think>.*?</think>`)
+	text = reThink.ReplaceAllString(text, "")
+
+	// Strip <thought>...</thought> tags if they exist
+	reThought := regexp.MustCompile(`(?s)<thought>.*?</thought>`)
+	text = reThought.ReplaceAllString(text, "")
+
+	return strings.TrimSpace(text)
 }
 
 // buildAIContext fetches and combines all AI context data
@@ -1912,4 +1975,48 @@ func isSimpleGreeting(msg string) bool {
 	}
 	return greetings[m]
 }
+
+// isContactOrLocationQuery checks if the user is asking for contact, maps, or address
+func isContactOrLocationQuery(msg string) bool {
+	m := strings.TrimSpace(strings.ToLower(msg))
+	keywords := []string{"contact", "address", "location", "maps", "office", "bengaluru", "direction", "where is"}
+	for _, k := range keywords {
+		if strings.Contains(m, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// getContactCardText returns the formatted static contact details card
+func getContactCardText() string {
+	return "📞 *Darvi Group – Contact Details*\n\n" +
+		"📍 *Address:*\n" +
+		"Darvi Group Office, Bengaluru, Karnataka, India\n\n" +
+		"🗺️ *Google Maps Link:*\n" +
+		"https://maps.google.com/?q=Darvi+Group+Bengaluru\n\n" +
+		"💬 *Customer Support:*\n" +
+		"For specific queries or other assistance, please reach out to our support team."
+}
+
+// sendGreetingMenu sends the default greeting response with buttons if configured
+func (a *App) sendGreetingMenu(account *models.WhatsAppAccount, contact *models.Contact, settings *models.ChatbotSettings) error {
+	body := settings.DefaultResponse
+	if body == "" {
+		body = "Welcome to Darvi Group!"
+	}
+	if len(settings.GreetingButtons) > 0 {
+		greetingButtons := make([]map[string]any, 0)
+		for _, btn := range settings.GreetingButtons {
+			if btnMap, ok := btn.(map[string]any); ok {
+				greetingButtons = append(greetingButtons, btnMap)
+			}
+		}
+		if len(greetingButtons) > 0 {
+			return a.sendAndSaveInteractiveButtons(account, contact, body, greetingButtons)
+		}
+	}
+	return a.sendAndSaveTextMessage(account, contact, body)
+}
+
 
