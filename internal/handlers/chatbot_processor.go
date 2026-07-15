@@ -510,8 +510,8 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 						return
 					}
 
-					// 3. Fallback to AI if enabled
-					if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+					// 3. Fallback to AI / RAG if available
+					if a.canAttemptAI(settings, account.Name) {
 						a.Log.Info("Active buttons node fallback to AI", "text", messageText)
 						aiResponse, err := a.generateAIResponse(settings, session, messageText)
 						if err == nil && aiResponse != "" {
@@ -599,8 +599,8 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 					}
 				}
 			}
-			// If not answered by keyword, try AI
-			if !answered && settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+			// If not answered by keyword, try AI / RAG
+			if !answered && a.canAttemptAI(settings, account.Name) {
 				a.Log.Info("New session non-greeting attempting AI response", "text", messageText)
 				aiResponse, err := a.generateAIResponse(settings, session, messageText)
 				if err == nil && aiResponse != "" {
@@ -654,8 +654,8 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		return
 	}
 
-	// If no keyword matched, try AI response if enabled
-	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+	// If no keyword matched, try AI / RAG response if available
+	if a.canAttemptAI(settings, account.Name) {
 		a.Log.Info("Attempting AI response", "provider", settings.AI.Provider, "model", settings.AI.Model)
 		aiResponse, err := a.generateAIResponse(settings, session, messageText)
 		if err != nil {
@@ -1006,16 +1006,39 @@ func (a *App) matchFlowTrigger(orgID uuid.UUID, messageText string) *models.Chat
 		return nil
 	}
 
-	messageLower := strings.ToLower(messageText)
-
 	for _, flow := range flows {
 		for _, keyword := range flow.TriggerKeywords {
-			if strings.Contains(messageLower, strings.ToLower(keyword)) {
+			if flowTriggerKeywordMatches(messageText, keyword) {
 				return &flow
 			}
 		}
 	}
 	return nil
+}
+
+// flowTriggerKeywordMatches decides if a flow trigger keyword applies to the
+// user message. Multi-word keywords use substring match; single tokens use
+// whole-word matching so short triggers like "hi" do not match inside "this"
+// / "which" and restart the entire welcome flow mid-conversation.
+func flowTriggerKeywordMatches(message, keyword string) bool {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" || strings.TrimSpace(message) == "" {
+		return false
+	}
+	msgLower := strings.ToLower(message)
+	kwLower := strings.ToLower(keyword)
+
+	// Phrase triggers (e.g. "main menu") keep contains semantics.
+	if strings.Contains(kwLower, " ") {
+		return strings.Contains(msgLower, kwLower)
+	}
+
+	// Whole-word match for single tokens.
+	re, err := regexp.Compile(`(?i)\b` + regexp.QuoteMeta(keyword) + `\b`)
+	if err != nil {
+		return strings.Contains(msgLower, kwLower)
+	}
+	return re.MatchString(message)
 }
 
 // startFlow initiates a chatbot flow for a user
@@ -1115,14 +1138,368 @@ type ApiResponse struct {
 	ResponseData map[string]any // Full API response data
 }
 
-// fetchApiResponse fetches a response from an external API, supporting message + buttons
-// and response_mapping for storing API data in session variables.
+// canAttemptAI reports whether we should try generateAIResponse for this org.
+// True when a local LLM provider is fully configured, OR when at least one
+// enabled RAG AI Context exists (RAG answers without a local provider key).
+func (a *App) canAttemptAI(settings *models.ChatbotSettings, whatsAppAccount string) bool {
+	if settings == nil {
+		return false
+	}
+	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+		return true
+	}
+	return a.hasEnabledRAGContext(settings.OrganizationID, whatsAppAccount)
+}
+
+// hasEnabledRAGContext returns true if the org has any enabled type=rag AI context.
+func (a *App) hasEnabledRAGContext(orgID uuid.UUID, whatsAppAccount string) bool {
+	contexts, err := a.getAIContextsCached(orgID, whatsAppAccount)
+	if err != nil {
+		return false
+	}
+	for _, ctx := range contexts {
+		if ctx.IsEnabled && ctx.ContextType == models.ContextTypeRAG {
+			return true
+		}
+	}
+	return false
+}
+
+// aiContextMatchesKeywords returns true when the context has no trigger keywords
+// (always match) or when userMessage contains any keyword (case-insensitive).
+func aiContextMatchesKeywords(ctx models.AIContext, userMessage string) bool {
+	if len(ctx.TriggerKeywords) == 0 {
+		return true
+	}
+	msg := strings.ToLower(userMessage)
+	for _, kw := range ctx.TriggerKeywords {
+		kw = strings.TrimSpace(kw)
+		if kw == "" {
+			continue
+		}
+		if strings.Contains(msg, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterMatchingAIContexts returns enabled contexts that match the user message
+// keywords, sorted by priority descending (higher first).
+func filterMatchingAIContexts(contexts []models.AIContext, userMessage string) []models.AIContext {
+	matched := make([]models.AIContext, 0, len(contexts))
+	for _, ctx := range contexts {
+		if !ctx.IsEnabled {
+			continue
+		}
+		if !aiContextMatchesKeywords(ctx, userMessage) {
+			continue
+		}
+		matched = append(matched, ctx)
+	}
+	// Priority desc (stable enough for small lists)
+	for i := 0; i < len(matched); i++ {
+		for j := i + 1; j < len(matched); j++ {
+			if matched[j].Priority > matched[i].Priority {
+				matched[i], matched[j] = matched[j], matched[i]
+			}
+		}
+	}
+	return matched
+}
+
+// normalizeRAGChatURL ensures the configured URL points at the /chat endpoint.
+func normalizeRAGChatURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	raw = strings.TrimRight(raw, "/")
+	lower := strings.ToLower(raw)
+	if strings.HasSuffix(lower, "/chat") {
+		return raw
+	}
+	return raw + "/chat"
+}
+
+// jsonConfigInt reads an int from JSONB config (float64/int/json.Number/string).
+func jsonConfigInt(cfg models.JSONB, key string, def int) int {
+	if cfg == nil {
+		return def
+	}
+	switch v := cfg[key].(type) {
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	case int:
+		if v > 0 {
+			return v
+		}
+	case int64:
+		if v > 0 {
+			return int(v)
+		}
+	case json.Number:
+		if n, err := v.Int64(); err == nil && n > 0 {
+			return int(n)
+		}
+	case string:
+		var out int
+		if _, err := fmt.Sscanf(strings.TrimSpace(v), "%d", &out); err == nil && out > 0 {
+			return out
+		}
+	}
+	return def
+}
+
+// jsonConfigFloat reads a float from JSONB config.
+func jsonConfigFloat(cfg models.JSONB, key string) (float64, bool) {
+	if cfg == nil {
+		return 0, false
+	}
+	switch v := cfg[key].(type) {
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// callRAGContext POSTs to an external RAG chat API and returns the answer.
+// Expects pdf_rag-compatible response: { "answer": "...", "abstained": bool }.
+func (a *App) callRAGContext(aiCtx models.AIContext, session *models.ChatbotSession, userMessage string) (answer string, abstained bool, err error) {
+	if aiCtx.ApiConfig == nil {
+		return "", false, fmt.Errorf("RAG context %q has empty api_config", aiCtx.Name)
+	}
+
+	rawURL, _ := aiCtx.ApiConfig["url"].(string)
+	chatURL := normalizeRAGChatURL(rawURL)
+	if chatURL == "" {
+		return "", false, fmt.Errorf("RAG context %q missing url", aiCtx.Name)
+	}
+
+	timeoutSecs := jsonConfigInt(aiCtx.ApiConfig, "timeout_seconds", 45)
+	if timeoutSecs < 10 {
+		timeoutSecs = 10
+	}
+	if timeoutSecs > 120 {
+		timeoutSecs = 120
+	}
+
+	// History for multi-turn RAG (last 4 turns). Drop the trailing user turn
+	// when it duplicates the current question (already logged before AI runs).
+	historyLimit := 4
+	var history []map[string]string
+	if session != nil {
+		msgs := a.getSessionHistory(session.ID, historyLimit*2)
+		qNorm := strings.TrimSpace(userMessage)
+		for _, m := range msgs {
+			role := "user"
+			if m.Direction == models.DirectionOutgoing {
+				role = "assistant"
+			}
+			content := strings.TrimSpace(m.Message)
+			if content == "" {
+				continue
+			}
+			history = append(history, map[string]string{
+				"role":    role,
+				"content": content,
+			})
+		}
+		if n := len(history); n > 0 && history[n-1]["role"] == "user" && history[n-1]["content"] == qNorm {
+			history = history[:n-1]
+		}
+	}
+
+	body := map[string]any{
+		"question": userMessage,
+		"source":   "whatomate",
+		"history":  history,
+	}
+	if session != nil {
+		body["session_id"] = session.ID.String()
+	}
+	if lang, ok := aiCtx.ApiConfig["language"].(string); ok && lang != "" {
+		body["language"] = lang
+	} else {
+		body["language"] = "en"
+	}
+	if topK := jsonConfigInt(aiCtx.ApiConfig, "top_k", 0); topK > 0 {
+		body["top_k"] = topK
+	}
+	if minScore, ok := jsonConfigFloat(aiCtx.ApiConfig, "min_score"); ok {
+		body["min_score"] = minScore
+	}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return "", false, fmt.Errorf("marshal RAG request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL, bytes.NewReader(jsonBody))
+	if err != nil {
+		return "", false, fmt.Errorf("create RAG request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if headers, ok := aiCtx.ApiConfig["headers"].(map[string]any); ok {
+		for k, v := range headers {
+			if s, ok := v.(string); ok && s != "" {
+				req.Header.Set(k, s)
+			}
+		}
+	}
+	// Convenience: api_key field → X-API-Key when header not set
+	if req.Header.Get("X-API-Key") == "" {
+		if key, ok := aiCtx.ApiConfig["api_key"].(string); ok && key != "" {
+			req.Header.Set("X-API-Key", key)
+		}
+	}
+
+	// Use a client whose Timeout matches RAG budget. The shared App.HTTPClient
+	// is often 30s and would abort free-model RAG calls early even when
+	// timeout_seconds is 45–60. Keep Transport (SSRF-safe dialer) when present.
+	client := &http.Client{Timeout: time.Duration(timeoutSecs) * time.Second}
+	if a.HTTPClient != nil && a.HTTPClient.Transport != nil {
+		client.Transport = a.HTTPClient.Transport
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", false, fmt.Errorf("RAG request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", false, fmt.Errorf("RAG API status %d: %s", resp.StatusCode, truncateLogValue(string(respBody), 200))
+	}
+
+	var result struct {
+		Answer    string `json:"answer"`
+		Abstained bool   `json:"abstained"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", false, fmt.Errorf("parse RAG response: %w", err)
+	}
+
+	a.Log.Info("RAG context answered",
+		"context", aiCtx.Name,
+		"url", redactURLForLog(chatURL),
+		"answer_len", len(result.Answer),
+		"abstained", result.Abstained,
+	)
+	return strings.TrimSpace(result.Answer), result.Abstained, nil
+}
+
+// tryRAGResponse attempts matching type=rag AI contexts in priority order.
+// ok=true means at least one RAG context was eligible (matched keywords).
+func (a *App) tryRAGResponse(orgID uuid.UUID, whatsAppAccount string, session *models.ChatbotSession, userMessage string) (answer string, ok bool, err error) {
+	contexts, err := a.getAIContextsCached(orgID, whatsAppAccount)
+	if err != nil || len(contexts) == 0 {
+		return "", false, nil
+	}
+
+	matched := filterMatchingAIContexts(contexts, userMessage)
+	var ragList []models.AIContext
+	for _, c := range matched {
+		if c.ContextType == models.ContextTypeRAG {
+			ragList = append(ragList, c)
+		}
+	}
+	if len(ragList) == 0 {
+		return "", false, nil
+	}
+
+	var lastErr error
+	for _, ragCtx := range ragList {
+		ans, abstained, callErr := a.callRAGContext(ragCtx, session, userMessage)
+		if callErr != nil {
+			a.Log.Warn("RAG context call failed", "context", ragCtx.Name, "error", callErr)
+			lastErr = callErr
+			continue
+		}
+		if abstained || ans == "" {
+			a.Log.Info("RAG context abstained or empty", "context", ragCtx.Name, "abstained", abstained)
+			continue
+		}
+		return ans, true, nil
+	}
+	// Eligible but no usable answer
+	return "", true, lastErr
+}
+
+// ragUserFacingFallback is sent when RAG is configured but returns no usable
+// answer and no local LLM fallback is available. Prefer settings.FallbackMessage.
+const ragUserFacingFallback = "I could not find that in our documents. Please try rephrasing your question, or choose Contact Us / Contact Expert from the menu."
+
+// generateAIResponse generates a reply for free-text / flow AI nodes.
+// Priority: matching RAG AI Contexts (external retrieve+generate) → local LLM
+// with static/api context only (never injects rag blobs).
 //
-// Mirrors fetchAPIContext in seeding implicit variables (phone_number) so flow-step
-// API templates can interpolate {{phone_number}} just like AI-context API templates.
+// Always prefers a user-visible string over a hard error when RAG was tried
+// and failed/abstained without a local provider — so WhatsApp users are not
+// left with silence after an ai_response node or free-text fallback.
 func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string) (string, error) {
-	// Build context from AIContext entries
-	contextData := a.buildAIContext(settings.OrganizationID, session, userMessage)
+	userMessage = strings.TrimSpace(userMessage)
+	if userMessage == "" {
+		return "", fmt.Errorf("empty user message for AI")
+	}
+
+	whatsAppAccount := ""
+	if session != nil {
+		whatsAppAccount = session.WhatsAppAccount
+	}
+	orgID := uuid.Nil
+	if settings != nil {
+		orgID = settings.OrganizationID
+	}
+	if orgID == uuid.Nil && session != nil {
+		orgID = session.OrganizationID
+	}
+
+	// 1) External RAG short-circuit (no full-document dump into local LLM)
+	ragTried := false
+	if answer, tried, err := a.tryRAGResponse(orgID, whatsAppAccount, session, userMessage); tried {
+		ragTried = true
+		if answer != "" {
+			return cleanAIResponse(answer), nil
+		}
+		if err != nil {
+			a.Log.Warn("RAG failed, falling back to local AI provider if configured", "error", err)
+		} else {
+			a.Log.Info("RAG abstained/empty, falling back to local AI provider if configured")
+		}
+	}
+
+	// 2) Legacy local provider path
+	localReady := settings != nil && settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != ""
+	if !localReady {
+		if ragTried || a.hasEnabledRAGContext(orgID, whatsAppAccount) {
+			// Soft fallback — still a successful reply for the chat layer
+			fallback := ragUserFacingFallback
+			if settings != nil && strings.TrimSpace(settings.FallbackMessage) != "" {
+				fallback = settings.FallbackMessage
+			}
+			a.Log.Info("Returning user-facing RAG/local fallback message")
+			return fallback, nil
+		}
+		return "", fmt.Errorf("AI provider not configured")
+	}
+
+	// Build context from static/api AIContext entries only (keyword-filtered)
+	contextData := a.buildAIContext(orgID, session, userMessage)
 
 	var answer string
 	var err error
@@ -1141,6 +1518,15 @@ func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *mode
 	}
 
 	if err != nil {
+		// If local LLM fails after RAG already failed, still give the user text
+		if ragTried {
+			fallback := ragUserFacingFallback
+			if strings.TrimSpace(settings.FallbackMessage) != "" {
+				fallback = settings.FallbackMessage
+			}
+			a.Log.Warn("Local AI failed after RAG; using fallback message", "error", err)
+			return fallback, nil
+		}
 		return "", err
 	}
 
@@ -1160,7 +1546,9 @@ func cleanAIResponse(text string) string {
 	return strings.TrimSpace(text)
 }
 
-// buildAIContext fetches and combines all AI context data
+// buildAIContext fetches and combines static/api AI context data for the local LLM.
+// type=rag is never injected here (handled by tryRAGResponse). Only contexts that
+// match trigger keywords (or have none) are included, highest priority first.
 func (a *App) buildAIContext(orgID uuid.UUID, session *models.ChatbotSession, userMessage string) string {
 	// Get WhatsApp account for cache key
 	whatsAppAccount := ""
@@ -1174,9 +1562,10 @@ func (a *App) buildAIContext(orgID uuid.UUID, session *models.ChatbotSession, us
 		return ""
 	}
 
+	matched := filterMatchingAIContexts(contexts, userMessage)
 	var contextParts []string
 
-	for _, ctx := range contexts {
+	for _, ctx := range matched {
 		var content string
 
 		switch ctx.ContextType {
@@ -1199,6 +1588,10 @@ func (a *App) buildAIContext(orgID uuid.UUID, session *models.ChatbotSession, us
 					content = apiContent
 				}
 			}
+
+		case models.ContextTypeRAG:
+			// Handled separately in tryRAGResponse — never dump into local prompt.
+			continue
 		}
 
 		if content != "" {

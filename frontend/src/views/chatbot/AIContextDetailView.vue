@@ -48,6 +48,12 @@ const form = ref({
   api_method: 'GET',
   api_headers: '{}',
   api_response_path: '',
+  // RAG-specific (stored in api_config)
+  rag_api_key: '',
+  rag_top_k: 8,
+  rag_min_score: 0.22,
+  rag_language: 'en',
+  rag_timeout_seconds: 45,
   priority: 10,
   enabled: true,
 })
@@ -79,6 +85,12 @@ async function loadContext() {
 
 function syncForm(data: any) {
   if (!data) return
+  const headers = data.api_config?.headers || {}
+  const ragKey =
+    data.api_config?.api_key ||
+    headers['X-API-Key'] ||
+    headers['x-api-key'] ||
+    ''
   form.value = {
     name: data.name || '',
     context_type: data.context_type || 'static',
@@ -86,8 +98,13 @@ function syncForm(data: any) {
     static_content: data.static_content || '',
     api_url: data.api_config?.url || '',
     api_method: data.api_config?.method || 'GET',
-    api_headers: JSON.stringify(data.api_config?.headers || {}, null, 2),
+    api_headers: JSON.stringify(headers, null, 2),
     api_response_path: data.api_config?.response_path || '',
+    rag_api_key: ragKey,
+    rag_top_k: data.api_config?.top_k ?? 8,
+    rag_min_score: data.api_config?.min_score ?? 0.22,
+    rag_language: data.api_config?.language || 'en',
+    rag_timeout_seconds: data.api_config?.timeout_seconds ?? 45,
     priority: data.priority ?? 10,
     enabled: data.enabled ?? true,
   }
@@ -108,9 +125,33 @@ function parseJSON(str: string): Record<string, any> {
 }
 
 function buildPayload() {
-  let headers = {}
-  if (form.value.api_headers.trim()) {
+  let headers: Record<string, any> = {}
+  if (form.value.context_type === 'api' && form.value.api_headers.trim()) {
     headers = parseJSON(form.value.api_headers)
+  }
+
+  let api_config: Record<string, any> = {}
+  if (form.value.context_type === 'api') {
+    api_config = {
+      url: form.value.api_url,
+      method: form.value.api_method,
+      headers,
+      response_path: form.value.api_response_path,
+    }
+  } else if (form.value.context_type === 'rag') {
+    const ragHeaders: Record<string, string> = {}
+    if (form.value.rag_api_key.trim()) {
+      ragHeaders['X-API-Key'] = form.value.rag_api_key.trim()
+    }
+    api_config = {
+      url: form.value.api_url.trim(),
+      headers: ragHeaders,
+      api_key: form.value.rag_api_key.trim() || undefined,
+      top_k: Number(form.value.rag_top_k) || 8,
+      min_score: Number(form.value.rag_min_score) || 0.22,
+      language: form.value.rag_language || 'en',
+      timeout_seconds: Number(form.value.rag_timeout_seconds) || 45,
+    }
   }
 
   return {
@@ -118,12 +159,7 @@ function buildPayload() {
     context_type: form.value.context_type,
     trigger_keywords: form.value.trigger_keywords.split(',').map(k => k.trim()).filter(Boolean),
     static_content: form.value.static_content,
-    api_config: form.value.context_type === 'api' ? {
-      url: form.value.api_url,
-      method: form.value.api_method,
-      headers,
-      response_path: form.value.api_response_path,
-    } : {},
+    api_config,
     priority: form.value.priority,
     enabled: form.value.enabled,
   }
@@ -135,8 +171,12 @@ async function save() {
     return
   }
 
-  if (form.value.context_type === 'api' && !form.value.api_url.trim()) {
+  if ((form.value.context_type === 'api' || form.value.context_type === 'rag') && !form.value.api_url.trim()) {
     toast.error(t('aiContexts.enterApiUrl', 'API URL is required'))
+    return
+  }
+  if (form.value.context_type === 'rag' && !form.value.rag_api_key.trim()) {
+    toast.error(t('aiContexts.enterRagApiKey', 'RAG API key is required'))
     return
   }
 
@@ -224,8 +264,12 @@ onMounted(async () => {
             <SelectContent>
               <SelectItem value="static">{{ $t('aiContexts.staticContent', 'Static Content') }}</SelectItem>
               <SelectItem value="api">{{ $t('aiContexts.apiFetch', 'API Fetch') }}</SelectItem>
+              <SelectItem value="rag">{{ $t('aiContexts.ragService', 'RAG (recommended)') }}</SelectItem>
             </SelectContent>
           </Select>
+          <p v-if="form.context_type === 'rag'" class="text-xs text-muted-foreground">
+            {{ $t('aiContexts.ragTypeHint', 'Calls your external RAG API (retrieve top chunks + answer). Prefer this over pasting long company PDFs into Static Content.') }}
+          </p>
         </div>
 
         <div class="space-y-1.5">
@@ -239,7 +283,7 @@ onMounted(async () => {
           </p>
         </div>
 
-        <div class="space-y-1.5">
+        <div v-if="form.context_type !== 'rag'" class="space-y-1.5">
           <Label class="text-xs">{{ $t('aiContexts.contentPrompt', 'Static Content') }}</Label>
           <Textarea
             v-model="form.static_content"
@@ -314,6 +358,65 @@ onMounted(async () => {
             :placeholder="$t('aiContexts.responsePathPlaceholder', '$.data.result')"
           />
           <p class="text-xs text-muted-foreground">{{ $t('aiContexts.responsePathHint', 'JSONPath to extract from the API response') }}</p>
+        </div>
+      </CardContent>
+    </Card>
+
+    <!-- RAG Configuration Card -->
+    <Card v-if="form.context_type === 'rag'">
+      <CardHeader class="pb-3">
+        <CardTitle class="text-sm font-medium">{{ $t('aiContexts.ragConfiguration', 'RAG Service') }}</CardTitle>
+      </CardHeader>
+      <CardContent class="space-y-4">
+        <p class="text-xs text-muted-foreground">
+          {{ $t('aiContexts.ragConfigHint', 'Point at your deployed pdf_rag /chat endpoint. Whatomate will POST the user question and use the answer directly (no full PDF dump into the local LLM).') }}
+        </p>
+
+        <div class="space-y-1.5">
+          <Label class="text-xs">{{ $t('aiContexts.ragUrl', 'RAG Chat URL') }} *</Label>
+          <Input
+            v-model="form.api_url"
+            placeholder="https://dchabotrag-production.up.railway.app/chat"
+          />
+          <p class="text-xs text-muted-foreground">
+            {{ $t('aiContexts.ragUrlHint', 'Full /chat URL or base URL ( /chat is appended automatically ).') }}
+          </p>
+        </div>
+
+        <div class="space-y-1.5">
+          <Label class="text-xs">{{ $t('aiContexts.ragApiKey', 'API Key (X-API-Key)') }} *</Label>
+          <Input
+            v-model="form.rag_api_key"
+            type="password"
+            autocomplete="off"
+            :placeholder="$t('aiContexts.ragApiKeyPlaceholder', 'Same API_KEY as Railway env')"
+          />
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div class="space-y-1.5">
+            <Label class="text-xs">{{ $t('aiContexts.ragTopK', 'Top K chunks') }}</Label>
+            <Input v-model.number="form.rag_top_k" type="number" min="1" max="20" />
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-xs">{{ $t('aiContexts.ragMinScore', 'Min score') }}</Label>
+            <Input v-model.number="form.rag_min_score" type="number" min="0" max="1" step="0.01" />
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-xs">{{ $t('aiContexts.ragLanguage', 'Language') }}</Label>
+            <Select v-model="form.rag_language">
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="en">English</SelectItem>
+                <SelectItem value="kn">Kannada</SelectItem>
+                <SelectItem value="hi">Hindi</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div class="space-y-1.5">
+            <Label class="text-xs">{{ $t('aiContexts.ragTimeout', 'Timeout (seconds)') }}</Label>
+            <Input v-model.number="form.rag_timeout_seconds" type="number" min="10" max="120" />
+          </div>
         </div>
       </CardContent>
     </Card>

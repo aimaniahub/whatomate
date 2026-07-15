@@ -755,34 +755,85 @@ func (a *App) execChatSetVariable(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome
 func (a *App) execChatAIResponse(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, error) {
 	settings, err := a.getChatbotSettingsCached(ctx.account.OrganizationID, ctx.account.Name)
 	if err != nil {
-		a.Log.Error("ai_response node failed to load chatbot settings",
+		// Still allow RAG-only orgs when chatbot_settings row is missing.
+		a.Log.Warn("ai_response node: chatbot settings missing; using org defaults for RAG",
 			"node", node.ID, "session", ctx.session.ID, "error", err)
-		return nodeOutcome{outcome: "default"}, nil
+		settings = &models.ChatbotSettings{
+			OrganizationID: ctx.account.OrganizationID,
+			AI:             models.AIConfig{Enabled: false},
+		}
 	}
-	if !settings.AI.Enabled || settings.AI.Provider == "" || settings.AI.APIKey == "" {
-		a.Log.Warn("ai_response node hit but AI not configured",
+	if !a.canAttemptAI(settings, ctx.account.Name) {
+		a.Log.Warn("ai_response node hit but AI/RAG not configured",
 			"node", node.ID, "session", ctx.session.ID,
 			"ai_enabled", settings.AI.Enabled, "has_provider", settings.AI.Provider != "")
+		// Do not advance silently — tell the user configuration is incomplete.
+		msg := "AI is not configured yet. Please use the menu or contact our team."
+		if strings.TrimSpace(settings.FallbackMessage) != "" {
+			msg = settings.FallbackMessage
+		}
+		if sendErr := a.sendAndSaveTextMessage(ctx.account, ctx.contact, msg); sendErr != nil {
+			a.Log.Error("ai_response failed to send not-configured message", "error", sendErr)
+		} else {
+			a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, msg, node.ID)
+		}
 		return nodeOutcome{outcome: "default"}, nil
 	}
 
-	userMessage := ctx.userInput
+	// Prefer prompt_template (e.g. {{ai_query}}); fall back to raw inbound text.
+	userMessage := strings.TrimSpace(ctx.userInput)
 	if tmpl := stringFromConfig(node.Config, "prompt_template", "prompt"); tmpl != "" {
 		if ctx.session.SessionData == nil {
 			ctx.session.SessionData = models.JSONB{}
 		}
-		userMessage = processTemplate(tmpl, ctx.session.SessionData)
+		rendered := strings.TrimSpace(processTemplate(tmpl, ctx.session.SessionData))
+		// If template did not resolve (literal "{{ai_query}}" left, or empty),
+		// use the inbound message that just arrived at the prompt step.
+		if rendered != "" && !strings.Contains(rendered, "{{") {
+			userMessage = rendered
+		} else if userMessage == "" {
+			userMessage = rendered
+		}
+	}
+	if userMessage == "" {
+		a.Log.Warn("ai_response node has empty user message",
+			"node", node.ID, "session", ctx.session.ID)
+		msg := "Please type your question and I will try to answer."
+		if sendErr := a.sendAndSaveTextMessage(ctx.account, ctx.contact, msg); sendErr != nil {
+			a.Log.Error("ai_response failed to send empty-input message", "error", sendErr)
+		} else {
+			a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, msg, node.ID)
+		}
+		return nodeOutcome{outcome: "default"}, nil
 	}
 
 	answer, err := a.generateAIResponse(settings, ctx.session, userMessage)
 	if err != nil {
 		a.Log.Error("ai_response node generateAIResponse failed",
 			"node", node.ID, "session", ctx.session.ID, "error", err)
+		msg := ragUserFacingFallback
+		if strings.TrimSpace(settings.FallbackMessage) != "" {
+			msg = settings.FallbackMessage
+		}
+		if sendErr := a.sendAndSaveTextMessage(ctx.account, ctx.contact, msg); sendErr != nil {
+			a.Log.Error("ai_response failed to send error fallback", "error", sendErr)
+		} else {
+			a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, msg, node.ID)
+		}
 		return nodeOutcome{outcome: "default"}, nil
 	}
 	if answer == "" {
 		a.Log.Warn("ai_response node got empty answer from provider",
 			"node", node.ID, "session", ctx.session.ID)
+		msg := ragUserFacingFallback
+		if strings.TrimSpace(settings.FallbackMessage) != "" {
+			msg = settings.FallbackMessage
+		}
+		if sendErr := a.sendAndSaveTextMessage(ctx.account, ctx.contact, msg); sendErr != nil {
+			a.Log.Error("ai_response failed to send empty-answer fallback", "error", sendErr)
+		} else {
+			a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, msg, node.ID)
+		}
 		return nodeOutcome{outcome: "default"}, nil
 	}
 

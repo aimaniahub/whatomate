@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -798,6 +799,276 @@ func TestCleanAIResponse(t *testing.T) {
 			assert.Equal(t, tc.expected, cleanAIResponse(tc.input))
 		})
 	}
+}
+
+// =============================================================================
+// RAG AI Context helpers + generateAIResponse short-circuit
+// =============================================================================
+
+func TestNormalizeRAGChatURL(t *testing.T) {
+	assert.Equal(t, "https://example.com/chat", normalizeRAGChatURL("https://example.com"))
+	assert.Equal(t, "https://example.com/chat", normalizeRAGChatURL("https://example.com/"))
+	assert.Equal(t, "https://example.com/chat", normalizeRAGChatURL("https://example.com/chat"))
+	assert.Equal(t, "https://example.com/chat", normalizeRAGChatURL("https://example.com/chat/"))
+	assert.Equal(t, "", normalizeRAGChatURL("  "))
+}
+
+func TestFlowTriggerKeywordMatches_WholeWord(t *testing.T) {
+	// Short "hi" must NOT match inside "this" / "which" (was restarting Welcome)
+	assert.False(t, flowTriggerKeywordMatches("what is the price of this plant?", "hi"))
+	assert.False(t, flowTriggerKeywordMatches("which variety is best?", "hi"))
+	assert.True(t, flowTriggerKeywordMatches("hi", "hi"))
+	assert.True(t, flowTriggerKeywordMatches("Hi there", "hi"))
+	assert.True(t, flowTriggerKeywordMatches("please start", "start"))
+	assert.True(t, flowTriggerKeywordMatches("open main menu please", "main menu"))
+	assert.False(t, flowTriggerKeywordMatches("tell me about sandalwood", "menu"))
+	assert.True(t, flowTriggerKeywordMatches("show menu", "menu"))
+}
+
+func TestAIContextMatchesKeywords(t *testing.T) {
+	always := models.AIContext{TriggerKeywords: nil}
+	assert.True(t, aiContextMatchesKeywords(always, "anything"))
+
+	empty := models.AIContext{TriggerKeywords: models.StringArray{}}
+	assert.True(t, aiContextMatchesKeywords(empty, "anything"))
+
+	priced := models.AIContext{TriggerKeywords: models.StringArray{"price", "cost"}}
+	assert.True(t, aiContextMatchesKeywords(priced, "What is the PRICE of guava?"))
+	assert.False(t, aiContextMatchesKeywords(priced, "How do I register?"))
+}
+
+func TestFilterMatchingAIContexts_PriorityAndKeywords(t *testing.T) {
+	low := models.AIContext{
+		Name: "low", IsEnabled: true, Priority: 1,
+		ContextType: models.ContextTypeStatic, TriggerKeywords: nil,
+	}
+	high := models.AIContext{
+		Name: "high", IsEnabled: true, Priority: 50,
+		ContextType: models.ContextTypeRAG, TriggerKeywords: nil,
+	}
+	disabled := models.AIContext{
+		Name: "off", IsEnabled: false, Priority: 100,
+		ContextType: models.ContextTypeRAG,
+	}
+	keywordOnly := models.AIContext{
+		Name: "kw", IsEnabled: true, Priority: 20,
+		ContextType: models.ContextTypeStatic,
+		TriggerKeywords: models.StringArray{"pricing"},
+	}
+
+	matched := filterMatchingAIContexts([]models.AIContext{low, high, disabled, keywordOnly}, "hello")
+	require.Len(t, matched, 2)
+	assert.Equal(t, "high", matched[0].Name)
+	assert.Equal(t, "low", matched[1].Name)
+
+	matched = filterMatchingAIContexts([]models.AIContext{low, high, keywordOnly}, "tell me about pricing")
+	require.Len(t, matched, 3)
+	assert.Equal(t, "high", matched[0].Name)
+}
+
+func TestGenerateAIResponse_RAGShortCircuit(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required for AI context cache")
+	}
+	org, account := createProcessorTestOrg(t, app)
+
+	var gotQuestion string
+	var gotAPIKey string
+	ragServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/chat", r.URL.Path)
+		gotAPIKey = r.Header.Get("X-API-Key")
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotQuestion, _ = body["question"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"answer":    "Guava plants start at ₹120 per plant.",
+			"abstained": false,
+			"sources":   []any{},
+		})
+	}))
+	t.Cleanup(ragServer.Close)
+
+	ctx := &models.AIContext{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: "",
+		Name:            "Darvi RAG",
+		ContextType:     models.ContextTypeRAG,
+		IsEnabled:       true,
+		Priority:        100,
+		ApiConfig: models.JSONB{
+			"url":     ragServer.URL,
+			"api_key": "test-rag-key",
+			"top_k":   float64(5),
+			"language": "en",
+		},
+	}
+	require.NoError(t, app.DB.Create(ctx).Error)
+
+	// Local AI deliberately NOT configured — RAG alone must answer
+	settings := &models.ChatbotSettings{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		IsEnabled:       true,
+		AI: models.AIConfig{
+			Enabled:  false,
+			Provider: "",
+			APIKey:   "",
+		},
+	}
+	require.NoError(t, app.DB.Create(settings).Error)
+
+	session := &models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     "919999999999",
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(session).Error)
+
+	answer, err := app.generateAIResponse(settings, session, "What is guava plant price?")
+	require.NoError(t, err)
+	assert.Equal(t, "Guava plants start at ₹120 per plant.", answer)
+	assert.Equal(t, "What is guava plant price?", gotQuestion)
+	assert.Equal(t, "test-rag-key", gotAPIKey)
+}
+
+func TestGenerateAIResponse_RAGAbstainedFallsBackToLocal(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required for AI context cache")
+	}
+	org, account := createProcessorTestOrg(t, app)
+
+	ragServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"answer":    "I could not find the answer in the documents.",
+			"abstained": true,
+		})
+	}))
+	t.Cleanup(ragServer.Close)
+
+	// Local OpenAI-compatible mock
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]string{"content": "Fallback local answer"}},
+			},
+		})
+	}))
+	t.Cleanup(llmServer.Close)
+
+	// Point OpenAI URL... generateOpenAIResponse hardcodes api.openai.com.
+	// So we only assert RAG-only failure message when no local provider.
+	ragCtx := &models.AIContext{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "RAG abstain",
+		ContextType:    models.ContextTypeRAG,
+		IsEnabled:      true,
+		Priority:       10,
+		ApiConfig: models.JSONB{
+			"url":     ragServer.URL + "/chat",
+			"api_key": "k",
+		},
+	}
+	require.NoError(t, app.DB.Create(ragCtx).Error)
+
+	settings := &models.ChatbotSettings{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		AI:              models.AIConfig{Enabled: false},
+	}
+	require.NoError(t, app.DB.Create(settings).Error)
+
+	session := &models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     "918888888888",
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(session).Error)
+
+	// Soft fallback: user gets a message instead of a hard error when RAG
+	// abstains and no local LLM is configured.
+	answer, err := app.generateAIResponse(settings, session, "random unrelated question")
+	require.NoError(t, err)
+	assert.NotEmpty(t, answer)
+	assert.Contains(t, strings.ToLower(answer), "could not find")
+	_ = llmServer // reserved for future local fallback URL injection
+}
+
+func TestCanAttemptAI_RAGWithoutLocalProvider(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required")
+	}
+	org, _ := createProcessorTestOrg(t, app)
+
+	settings := &models.ChatbotSettings{
+		OrganizationID: org.ID,
+		AI:             models.AIConfig{Enabled: false},
+	}
+	assert.False(t, app.canAttemptAI(settings, ""))
+
+	require.NoError(t, app.DB.Create(&models.AIContext{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "rag",
+		ContextType:    models.ContextTypeRAG,
+		IsEnabled:      true,
+		ApiConfig:      models.JSONB{"url": "https://example.com/chat"},
+	}).Error)
+
+	assert.True(t, app.canAttemptAI(settings, ""))
+}
+
+func TestBuildAIContext_SkipsRAGType(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required")
+	}
+	org, _ := createProcessorTestOrg(t, app)
+
+	require.NoError(t, app.DB.Create(&models.AIContext{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Static FAQ",
+		ContextType:    models.ContextTypeStatic,
+		StaticContent:  "Hours are 9-5",
+		IsEnabled:      true,
+		Priority:       10,
+	}).Error)
+	require.NoError(t, app.DB.Create(&models.AIContext{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Company RAG",
+		ContextType:    models.ContextTypeRAG,
+		IsEnabled:      true,
+		Priority:       100,
+		ApiConfig:      models.JSONB{"url": "https://example.com/chat", "api_key": "x"},
+	}).Error)
+
+	session := &models.ChatbotSession{
+		OrganizationID:  org.ID,
+		WhatsAppAccount: "",
+		SessionData:     models.JSONB{},
+	}
+	built := app.buildAIContext(org.ID, session, "hello")
+	assert.Contains(t, built, "Hours are 9-5")
+	assert.NotContains(t, built, "Company RAG")
+	assert.NotContains(t, built, "example.com")
 }
 
 

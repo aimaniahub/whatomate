@@ -200,12 +200,20 @@ async function toggleContext(context: AIContext) {
                 </template>
                 <template #cell-context_type="{ item: context }">
                   <Badge
-                    :class="context.context_type === 'api'
-                      ? 'bg-blue-500/20 text-blue-400 border-transparent'
-                      : 'bg-orange-500/20 text-orange-400 border-transparent'"
+                    :class="context.context_type === 'rag'
+                      ? 'bg-violet-500/20 text-violet-400 border-transparent'
+                      : context.context_type === 'api'
+                        ? 'bg-blue-500/20 text-blue-400 border-transparent'
+                        : 'bg-orange-500/20 text-orange-400 border-transparent'"
                     class="text-xs"
                   >
-                    {{ context.context_type === 'api' ? $t('aiContexts.apiFetch') : $t('aiContexts.static') }}
+                    {{
+                      context.context_type === 'rag'
+                        ? $t('aiContexts.rag', 'RAG')
+                        : context.context_type === 'api'
+                          ? $t('aiContexts.apiFetch')
+                          : $t('aiContexts.static')
+                    }}
                   </Badge>
                 </template>
                 <template #cell-trigger_keywords="{ item: context }">

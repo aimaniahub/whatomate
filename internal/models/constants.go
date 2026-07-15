@@ -166,6 +166,10 @@ type ContextType string
 const (
 	ContextTypeStatic ContextType = "static"
 	ContextTypeAPI    ContextType = "api"
+	// ContextTypeRAG calls an external RAG chat API (retrieve + generate)
+	// and returns the answer directly — never dumps full documents into the
+	// local LLM system prompt.
+	ContextTypeRAG ContextType = "rag"
 )
 
 // InputType represents chatbot flow step input types

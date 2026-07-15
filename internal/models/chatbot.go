@@ -251,7 +251,16 @@ func (ChatbotSessionMessage) TableName() string {
 	return "chatbot_session_messages"
 }
 
-// AIContext provides context data for AI responses
+// AIContext provides context data for AI responses.
+//
+// Context types:
+//   - static: paste text used as local-LLM system context (prefer RAG for large docs)
+//   - api: fetch dynamic context via HTTP, then feed local LLM
+//   - rag: call external RAG chat API (e.g. pdf_rag POST /chat); answer is used
+//     directly — does not dump full company PDFs into the local LLM prompt.
+//
+// For rag, ApiConfig holds: url, headers (X-API-Key), optional top_k, min_score,
+// language, timeout_seconds.
 type AIContext struct {
 	BaseModel
 	OrganizationID  uuid.UUID   `gorm:"type:uuid;index;not null" json:"organization_id"`
@@ -259,10 +268,10 @@ type AIContext struct {
 	Name            string      `gorm:"size:255;not null" json:"name"`
 	IsEnabled       bool        `gorm:"default:true" json:"is_enabled"`
 	Priority        int         `gorm:"default:10" json:"priority"`
-	ContextType     ContextType `gorm:"size:20;not null" json:"context_type"` // static, api
+	ContextType     ContextType `gorm:"size:20;not null" json:"context_type"` // static, api, rag
 	TriggerKeywords StringArray `gorm:"type:jsonb" json:"trigger_keywords"`
 	StaticContent   string      `gorm:"type:text" json:"static_content"`
-	ApiConfig       JSONB       `gorm:"type:jsonb" json:"api_config"` // url, method, headers, body
+	ApiConfig       JSONB       `gorm:"type:jsonb" json:"api_config"` // url, method, headers, body; rag: url, headers, top_k, ...
 	CreatedByID     *uuid.UUID  `gorm:"type:uuid" json:"created_by_id,omitempty"`
 	UpdatedByID     *uuid.UUID  `gorm:"type:uuid" json:"updated_by_id,omitempty"`
 

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -1180,6 +1181,21 @@ func (a *App) CreateAIContext(r *fastglue.Request) error {
 	if req.ContextType == "" {
 		req.ContextType = models.ContextTypeStatic
 	}
+	switch req.ContextType {
+	case models.ContextTypeStatic, models.ContextTypeAPI, models.ContextTypeRAG:
+		// ok
+	default:
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid context_type (use static, api, or rag)", nil, "")
+	}
+	if req.ContextType == models.ContextTypeAPI || req.ContextType == models.ContextTypeRAG {
+		if req.ApiConfig == nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "api_config is required for api/rag context types", nil, "")
+		}
+		url, _ := req.ApiConfig["url"].(string)
+		if strings.TrimSpace(url) == "" {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "api_config.url is required for api/rag context types", nil, "")
+		}
+	}
 
 	ctx := models.AIContext{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
@@ -1290,9 +1306,14 @@ func (a *App) UpdateAIContext(r *fastglue.Request) error {
 		aiCtx.Name = *req.Name
 	}
 	if req.ContextType != nil {
-		aiCtx.ContextType = *req.ContextType
+		switch *req.ContextType {
+		case models.ContextTypeStatic, models.ContextTypeAPI, models.ContextTypeRAG:
+			aiCtx.ContextType = *req.ContextType
+		default:
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid context_type (use static, api, or rag)", nil, "")
+		}
 	}
-	if len(req.TriggerKeywords) > 0 {
+	if req.TriggerKeywords != nil {
 		aiCtx.TriggerKeywords = req.TriggerKeywords
 	}
 	if req.StaticContent != nil {
@@ -1306,6 +1327,16 @@ func (a *App) UpdateAIContext(r *fastglue.Request) error {
 	}
 	if req.Enabled != nil {
 		aiCtx.IsEnabled = *req.Enabled
+	}
+	// Validate final type/config
+	if aiCtx.ContextType == models.ContextTypeAPI || aiCtx.ContextType == models.ContextTypeRAG {
+		if aiCtx.ApiConfig == nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "api_config is required for api/rag context types", nil, "")
+		}
+		url, _ := aiCtx.ApiConfig["url"].(string)
+		if strings.TrimSpace(url) == "" {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "api_config.url is required for api/rag context types", nil, "")
+		}
 	}
 	aiCtx.UpdatedByID = &userID
 
