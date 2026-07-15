@@ -520,22 +520,10 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 							}
 							a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
 
-							// Re-send the current buttons node menu so they are not stuck
-							bodyText := stringFromConfig(node.Config, "body", "message", "text")
-							if bodyText == "" {
-								bodyText = node.Label
-							}
-							bodyText = processTemplate(bodyText, session.SessionData)
-							btnList := buttonsFromConfig(node.Config)
-							for _, b := range btnList {
-								for _, key := range []string{"title", "url", "phone_number"} {
-									if s, ok := b[key].(string); ok && s != "" {
-										b[key] = processTemplate(s, session.SessionData)
-									}
-								}
-							}
-							if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
-								a.Log.Error("Failed to re-send buttons menu after AI fallback", "error", err)
+							// After answering, always bring the user back to the main menu
+							// so they can navigate (Registration Hub / Service Query / Ask Darvi AI / Contact Us)
+							if err := a.sendGreetingMenu(account, contact, settings); err != nil {
+								a.Log.Error("Failed to re-send main menu after AI fallback", "error", err)
 							}
 							return
 						}
@@ -668,9 +656,10 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 			}
 			a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
 
-			// Re-send the greeting menu buttons so users can navigate
+			// Always re-send the main menu after an AI/RAG answer so the user
+			// can continue navigating (Registration Hub / Service Query / Ask Darvi AI / Contact Us).
 			if err := a.sendGreetingMenu(account, contact, settings); err != nil {
-				a.Log.Error("Failed to send greeting menu after AI response", "error", err)
+				a.Log.Error("Failed to send main menu after AI response", "error", err)
 			}
 			return
 		} else {
@@ -2396,7 +2385,8 @@ func getContactCardText() string {
 func (a *App) sendGreetingMenu(account *models.WhatsAppAccount, contact *models.Contact, settings *models.ChatbotSettings) error {
 	body := settings.DefaultResponse
 	if body == "" {
-		body = "Welcome to Darvi Group!"
+		// No greeting configured — nothing to send.
+		return nil
 	}
 	if len(settings.GreetingButtons) > 0 {
 		greetingButtons := make([]map[string]any, 0)
