@@ -27,11 +27,12 @@ type ChatbotSettingsResponse struct {
 	AllowAgentQueuePickup        bool              `json:"allow_agent_queue_pickup"`
 	AssignToSameAgent            bool              `json:"assign_to_same_agent"`
 	AgentCurrentConversationOnly bool              `json:"agent_current_conversation_only"`
-	AIEnabled                    bool              `json:"ai_enabled"`
-	AIProvider                   models.AIProvider `json:"ai_provider"`
-	AIModel                      string            `json:"ai_model"`
-	AIMaxTokens                  int               `json:"ai_max_tokens"`
-	AISystemPrompt               string            `json:"ai_system_prompt"`
+	AIEnabled                    bool                  `json:"ai_enabled"`
+	AIProvider                   models.AIProvider     `json:"ai_provider"`
+	AIModel                      string                `json:"ai_model"`
+	AIMaxTokens                  int                   `json:"ai_max_tokens"`
+	AISystemPrompt               string                `json:"ai_system_prompt"`
+	AIFreeTextMode               models.FreeTextAIMode `json:"ai_free_text_mode"`
 	// SLA Settings
 	SLAEnabled             bool     `json:"sla_enabled"`
 	SLAResponseMinutes     int      `json:"sla_response_minutes"`
@@ -177,6 +178,7 @@ func (a *App) GetChatbotSettings(r *fastglue.Request) error {
 		AIModel:        settings.AI.Model,
 		AIMaxTokens:    settings.AI.MaxTokens,
 		AISystemPrompt: settings.AI.SystemPrompt,
+		AIFreeTextMode: resolveFreeTextMode(&settings, a.hasEnabledRAGContext(orgID, "")),
 		// SLA Settings
 		SLAEnabled:             settings.SLA.Enabled,
 		SLAResponseMinutes:     settings.SLA.ResponseMinutes,
@@ -257,11 +259,12 @@ func chatbotSLASnapshot(s *models.ChatbotSettings) map[string]any {
 // change the activity log should surface.
 func chatbotAISnapshot(s *models.ChatbotSettings) map[string]any {
 	return map[string]any{
-		"ai_enabled":       s.AI.Enabled,
-		"ai_provider":      s.AI.Provider,
-		"ai_model":         s.AI.Model,
-		"ai_max_tokens":    s.AI.MaxTokens,
-		"ai_system_prompt": s.AI.SystemPrompt,
+		"ai_enabled":         s.AI.Enabled,
+		"ai_provider":        s.AI.Provider,
+		"ai_model":           s.AI.Model,
+		"ai_max_tokens":      s.AI.MaxTokens,
+		"ai_system_prompt":   s.AI.SystemPrompt,
+		"ai_free_text_mode":  s.AI.FreeTextMode,
 	}
 }
 
@@ -285,12 +288,13 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		AllowAgentQueuePickup        *bool              `json:"allow_agent_queue_pickup"`
 		AssignToSameAgent            *bool              `json:"assign_to_same_agent"`
 		AgentCurrentConversationOnly *bool              `json:"agent_current_conversation_only"`
-		AIEnabled                    *bool              `json:"ai_enabled"`
-		AIProvider                   *models.AIProvider `json:"ai_provider"`
-		AIAPIKey                     *string            `json:"ai_api_key"`
-		AIModel                      *string            `json:"ai_model"`
-		AIMaxTokens                  *int               `json:"ai_max_tokens"`
-		AISystemPrompt               *string            `json:"ai_system_prompt"`
+		AIEnabled                    *bool                  `json:"ai_enabled"`
+		AIProvider                   *models.AIProvider     `json:"ai_provider"`
+		AIAPIKey                     *string                `json:"ai_api_key"`
+		AIModel                      *string                `json:"ai_model"`
+		AIMaxTokens                  *int                   `json:"ai_max_tokens"`
+		AISystemPrompt               *string                `json:"ai_system_prompt"`
+		AIFreeTextMode               *models.FreeTextAIMode `json:"ai_free_text_mode"`
 		// SLA Settings
 		SLAEnabled             *bool     `json:"sla_enabled"`
 		SLAResponseMinutes     *int      `json:"sla_response_minutes"`
@@ -350,7 +354,8 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		req.ClientReminderMessage != nil || req.ClientAutoCloseMinutes != nil ||
 		req.ClientAutoCloseMessage != nil
 	aiTouched := req.AIEnabled != nil || req.AIProvider != nil || req.AIAPIKey != nil ||
-		req.AIModel != nil || req.AIMaxTokens != nil || req.AISystemPrompt != nil
+		req.AIModel != nil || req.AIMaxTokens != nil || req.AISystemPrompt != nil ||
+		req.AIFreeTextMode != nil
 
 	// Update fields if provided
 	if req.Enabled != nil {
@@ -426,6 +431,15 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	}
 	if req.AISystemPrompt != nil {
 		settings.AI.SystemPrompt = *req.AISystemPrompt
+	}
+	if req.AIFreeTextMode != nil {
+		mode := *req.AIFreeTextMode
+		switch mode {
+		case models.FreeTextAIOff, models.FreeTextAIRAGOnly, models.FreeTextAIRAGThenLocal, models.FreeTextAILocalOnly, "":
+			settings.AI.FreeTextMode = mode
+		default:
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid ai_free_text_mode (use off, rag_only, rag_then_local, local_only)", nil, "")
+		}
 	}
 
 	// SLA Settings

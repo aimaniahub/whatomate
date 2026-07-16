@@ -644,7 +644,9 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 
 	// If no keyword matched, try AI / RAG response if available
 	if a.canAttemptAI(settings, account.Name) {
-		a.Log.Info("Attempting AI response", "provider", settings.AI.Provider, "model", settings.AI.Model)
+		hasRAG := a.hasEnabledRAGContext(account.OrganizationID, account.Name)
+		mode := resolveFreeTextMode(settings, hasRAG)
+		a.Log.Info("Attempting AI response", "mode", mode, "provider", settings.AI.Provider, "model", settings.AI.Model, "has_rag", hasRAG)
 		aiResponse, err := a.generateAIResponse(settings, session, messageText)
 		if err != nil {
 			a.Log.Error("AI response failed", "error", err, "provider", settings.AI.Provider, "model", settings.AI.Model)
@@ -1127,17 +1129,57 @@ type ApiResponse struct {
 	ResponseData map[string]any // Full API response data
 }
 
+// resolveFreeTextMode returns the effective free-text AI mode for settings.
+// Empty/legacy rows resolve safely:
+//   - enabled RAG context → rag_only (prefer knowledge base over free LLMs)
+//   - else local LLM configured → local_only
+//   - else → off
+func resolveFreeTextMode(settings *models.ChatbotSettings, hasRAG bool) models.FreeTextAIMode {
+	if settings == nil {
+		if hasRAG {
+			return models.FreeTextAIRAGOnly
+		}
+		return models.FreeTextAIOff
+	}
+	switch settings.AI.FreeTextMode {
+	case models.FreeTextAIOff, models.FreeTextAIRAGOnly, models.FreeTextAIRAGThenLocal, models.FreeTextAILocalOnly:
+		return settings.AI.FreeTextMode
+	}
+	// Legacy / empty: prefer RAG when available so OpenRouter does not invent answers.
+	if hasRAG {
+		return models.FreeTextAIRAGOnly
+	}
+	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+		return models.FreeTextAILocalOnly
+	}
+	return models.FreeTextAIOff
+}
+
+// localAIReady reports whether a local LLM provider is fully configured.
+func localAIReady(settings *models.ChatbotSettings) bool {
+	return settings != nil && settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != ""
+}
+
 // canAttemptAI reports whether we should try generateAIResponse for this org.
-// True when a local LLM provider is fully configured, OR when at least one
-// enabled RAG AI Context exists (RAG answers without a local provider key).
+// Honors free-text mode: off never attempts; rag_* needs RAG; local needs provider.
 func (a *App) canAttemptAI(settings *models.ChatbotSettings, whatsAppAccount string) bool {
 	if settings == nil {
 		return false
 	}
-	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
-		return true
+	hasRAG := a.hasEnabledRAGContext(settings.OrganizationID, whatsAppAccount)
+	mode := resolveFreeTextMode(settings, hasRAG)
+	switch mode {
+	case models.FreeTextAIOff:
+		return false
+	case models.FreeTextAIRAGOnly:
+		return hasRAG
+	case models.FreeTextAIRAGThenLocal:
+		return hasRAG || localAIReady(settings)
+	case models.FreeTextAILocalOnly:
+		return localAIReady(settings)
+	default:
+		return hasRAG || localAIReady(settings)
 	}
-	return a.hasEnabledRAGContext(settings.OrganizationID, whatsAppAccount)
 }
 
 // hasEnabledRAGContext returns true if the org has any enabled type=rag AI context.
@@ -1392,19 +1434,30 @@ func (a *App) callRAGContext(aiCtx models.AIContext, session *models.ChatbotSess
 	return strings.TrimSpace(result.Answer), result.Abstained, nil
 }
 
-// tryRAGResponse attempts matching type=rag AI contexts in priority order.
-// ok=true means at least one RAG context was eligible (matched keywords).
+// tryRAGResponse attempts enabled type=rag AI contexts in priority order.
+// RAG contexts always match free-text (keywords are not required) so company
+// knowledge is not gated by trigger keyword lists. Keywords still apply to
+// static/api contexts used for local LLM system prompts.
+// ok=true means at least one enabled RAG context was eligible to call.
 func (a *App) tryRAGResponse(orgID uuid.UUID, whatsAppAccount string, session *models.ChatbotSession, userMessage string) (answer string, ok bool, err error) {
 	contexts, err := a.getAIContextsCached(orgID, whatsAppAccount)
 	if err != nil || len(contexts) == 0 {
 		return "", false, nil
 	}
 
-	matched := filterMatchingAIContexts(contexts, userMessage)
 	var ragList []models.AIContext
-	for _, c := range matched {
-		if c.ContextType == models.ContextTypeRAG {
-			ragList = append(ragList, c)
+	for _, c := range contexts {
+		if !c.IsEnabled || c.ContextType != models.ContextTypeRAG {
+			continue
+		}
+		ragList = append(ragList, c)
+	}
+	// Priority desc (higher first)
+	for i := 0; i < len(ragList); i++ {
+		for j := i + 1; j < len(ragList); j++ {
+			if ragList[j].Priority > ragList[i].Priority {
+				ragList[i], ragList[j] = ragList[j], ragList[i]
+			}
 		}
 	}
 	if len(ragList) == 0 {
@@ -1413,6 +1466,7 @@ func (a *App) tryRAGResponse(orgID uuid.UUID, whatsAppAccount string, session *m
 
 	var lastErr error
 	for _, ragCtx := range ragList {
+		a.Log.Info("RAG attempt", "context", ragCtx.Name, "priority", ragCtx.Priority)
 		ans, abstained, callErr := a.callRAGContext(ragCtx, session, userMessage)
 		if callErr != nil {
 			a.Log.Warn("RAG context call failed", "context", ragCtx.Name, "error", callErr)
@@ -1423,6 +1477,7 @@ func (a *App) tryRAGResponse(orgID uuid.UUID, whatsAppAccount string, session *m
 			a.Log.Info("RAG context abstained or empty", "context", ragCtx.Name, "abstained", abstained)
 			continue
 		}
+		a.Log.Info("RAG answer", "context", ragCtx.Name, "answer_len", len(ans))
 		return ans, true, nil
 	}
 	// Eligible but no usable answer
@@ -1434,12 +1489,15 @@ func (a *App) tryRAGResponse(orgID uuid.UUID, whatsAppAccount string, session *m
 const ragUserFacingFallback = "I could not find that in our documents. Please try rephrasing your question, or choose Contact Us / Contact Expert from the menu."
 
 // generateAIResponse generates a reply for free-text / flow AI nodes.
-// Priority: matching RAG AI Contexts (external retrieve+generate) → local LLM
-// with static/api context only (never injects rag blobs).
+// Honors settings.AI.FreeTextMode (see resolveFreeTextMode):
+//   - off: no AI
+//   - rag_only: enabled RAG contexts only (never local OpenRouter/etc.)
+//   - rag_then_local: RAG first, then local if configured
+//   - local_only: skip RAG; local only
 //
 // Always prefers a user-visible string over a hard error when RAG was tried
-// and failed/abstained without a local provider — so WhatsApp users are not
-// left with silence after an ai_response node or free-text fallback.
+// and failed/abstained without a permitted local provider — so WhatsApp users
+// are not left with silence after an ai_response node or free-text fallback.
 func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string) (string, error) {
 	userMessage = strings.TrimSpace(userMessage)
 	if userMessage == "" {
@@ -1458,34 +1516,68 @@ func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *mode
 		orgID = session.OrganizationID
 	}
 
-	// 1) External RAG short-circuit (no full-document dump into local LLM)
-	ragTried := false
-	if answer, tried, err := a.tryRAGResponse(orgID, whatsAppAccount, session, userMessage); tried {
-		ragTried = true
-		if answer != "" {
-			return cleanAIResponse(answer), nil
-		}
-		if err != nil {
-			a.Log.Warn("RAG failed, falling back to local AI provider if configured", "error", err)
-		} else {
-			a.Log.Info("RAG abstained/empty, falling back to local AI provider if configured")
-		}
+	hasRAG := a.hasEnabledRAGContext(orgID, whatsAppAccount)
+	mode := resolveFreeTextMode(settings, hasRAG)
+	localReady := localAIReady(settings)
+	providerStr := ""
+	if settings != nil {
+		providerStr = string(settings.AI.Provider)
 	}
 
-	// 2) Legacy local provider path
-	localReady := settings != nil && settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != ""
-	if !localReady {
-		if ragTried || a.hasEnabledRAGContext(orgID, whatsAppAccount) {
-			// Soft fallback — still a successful reply for the chat layer
+	a.Log.Info("Free-text AI path",
+		"mode", mode,
+		"has_rag", hasRAG,
+		"local_enabled", localReady,
+		"ai_provider", providerStr,
+	)
+
+	if mode == models.FreeTextAIOff {
+		a.Log.Info("Local LLM skipped", "reason", "free_text_mode_off")
+		return "", fmt.Errorf("free-text AI mode is off")
+	}
+
+	// 1) External RAG (all enabled RAG contexts; no keyword gate)
+	ragTried := false
+	if mode == models.FreeTextAIRAGOnly || mode == models.FreeTextAIRAGThenLocal {
+		if answer, tried, err := a.tryRAGResponse(orgID, whatsAppAccount, session, userMessage); tried {
+			ragTried = true
+			if answer != "" {
+				return cleanAIResponse(answer), nil
+			}
+			if err != nil {
+				a.Log.Warn("RAG failed", "error", err, "mode", mode)
+			} else {
+				a.Log.Info("RAG abstained/empty", "mode", mode)
+			}
+		} else if mode == models.FreeTextAIRAGOnly {
+			// Mode wants RAG but no context configured
+			a.Log.Warn("rag_only mode but no enabled RAG context answered", "org", orgID)
+		}
+	} else {
+		a.Log.Info("RAG skipped", "reason", "mode_"+string(mode))
+	}
+
+	// 2) Local LLM only when mode allows it
+	allowLocal := (mode == models.FreeTextAIRAGThenLocal || mode == models.FreeTextAILocalOnly) && localReady
+	if !allowLocal {
+		if mode == models.FreeTextAIRAGOnly || ragTried || hasRAG {
 			fallback := ragUserFacingFallback
 			if settings != nil && strings.TrimSpace(settings.FallbackMessage) != "" {
 				fallback = settings.FallbackMessage
 			}
+			if mode == models.FreeTextAIRAGOnly {
+				a.Log.Info("Local LLM skipped", "reason", "rag_only_mode")
+			} else if !localReady {
+				a.Log.Info("Local LLM skipped", "reason", "ai_disabled")
+			}
 			a.Log.Info("Returning user-facing RAG/local fallback message")
 			return fallback, nil
 		}
+		a.Log.Info("Local LLM skipped", "reason", "not_configured_or_mode")
 		return "", fmt.Errorf("AI provider not configured")
 	}
+
+	a.Log.Info("Local LLM attempt", "provider", settings.AI.Provider, "model", settings.AI.Model)
 
 	// Build context from static/api AIContext entries only (keyword-filtered)
 	contextData := a.buildAIContext(orgID, session, userMessage)

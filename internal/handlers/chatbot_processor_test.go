@@ -1034,6 +1034,221 @@ func TestCanAttemptAI_RAGWithoutLocalProvider(t *testing.T) {
 	assert.True(t, app.canAttemptAI(settings, ""))
 }
 
+func TestResolveFreeTextMode(t *testing.T) {
+	assert.Equal(t, models.FreeTextAIRAGOnly, resolveFreeTextMode(&models.ChatbotSettings{
+		AI: models.AIConfig{FreeTextMode: models.FreeTextAIRAGOnly},
+	}, true))
+	assert.Equal(t, models.FreeTextAIOff, resolveFreeTextMode(&models.ChatbotSettings{
+		AI: models.AIConfig{FreeTextMode: models.FreeTextAIOff},
+	}, true))
+	// Legacy empty: prefer RAG when present
+	assert.Equal(t, models.FreeTextAIRAGOnly, resolveFreeTextMode(&models.ChatbotSettings{
+		AI: models.AIConfig{},
+	}, true))
+	// Legacy empty, no RAG, local ready → local_only
+	assert.Equal(t, models.FreeTextAILocalOnly, resolveFreeTextMode(&models.ChatbotSettings{
+		AI: models.AIConfig{Enabled: true, Provider: models.AIProviderOpenRouter, APIKey: "k"},
+	}, false))
+	// Nothing configured
+	assert.Equal(t, models.FreeTextAIOff, resolveFreeTextMode(&models.ChatbotSettings{
+		AI: models.AIConfig{},
+	}, false))
+}
+
+func TestGenerateAIResponse_RAGIgnoresKeywords(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required for AI context cache")
+	}
+	org, account := createProcessorTestOrg(t, app)
+
+	var gotQuestion string
+	ragServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotQuestion, _ = body["question"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"answer":    "Darvi Group provides agricultural solutions.",
+			"abstained": false,
+		})
+	}))
+	t.Cleanup(ragServer.Close)
+
+	// Keywords would NOT match "what the company does" — must still call RAG.
+	require.NoError(t, app.DB.Create(&models.AIContext{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: "",
+		Name:            "Darvi RAG",
+		ContextType:     models.ContextTypeRAG,
+		IsEnabled:       true,
+		Priority:        100,
+		TriggerKeywords: models.StringArray{"plant", "price", "coconut"},
+		ApiConfig: models.JSONB{
+			"url":     ragServer.URL,
+			"api_key": "test-rag-key",
+		},
+	}).Error)
+
+	settings := &models.ChatbotSettings{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		IsEnabled:       true,
+		AI: models.AIConfig{
+			Enabled:      true,
+			Provider:     models.AIProviderOpenRouter,
+			APIKey:       "should-not-be-used",
+			Model:        "openai/gpt-oss-20b:free",
+			FreeTextMode: models.FreeTextAIRAGOnly,
+		},
+	}
+	require.NoError(t, app.DB.Create(settings).Error)
+
+	session := &models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     "919999999999",
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(session).Error)
+
+	answer, err := app.generateAIResponse(settings, session, "what the company does")
+	require.NoError(t, err)
+	assert.Equal(t, "Darvi Group provides agricultural solutions.", answer)
+	assert.Equal(t, "what the company does", gotQuestion)
+}
+
+func TestGenerateAIResponse_RAGOnlyNeverUsesLocal(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required for AI context cache")
+	}
+	org, account := createProcessorTestOrg(t, app)
+
+	// RAG abstains → must return fallback, not invent via local
+	ragServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"answer":    "",
+			"abstained": true,
+		})
+	}))
+	t.Cleanup(ragServer.Close)
+
+	require.NoError(t, app.DB.Create(&models.AIContext{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Darvi RAG",
+		ContextType:    models.ContextTypeRAG,
+		IsEnabled:      true,
+		ApiConfig:      models.JSONB{"url": ragServer.URL, "api_key": "k"},
+	}).Error)
+
+	settings := &models.ChatbotSettings{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		IsEnabled:       true,
+		FallbackMessage: "Please rephrase or use the menu.",
+		AI: models.AIConfig{
+			Enabled:      true,
+			Provider:     models.AIProviderOpenRouter,
+			APIKey:       "local-key",
+			Model:        "fake/model",
+			FreeTextMode: models.FreeTextAIRAGOnly,
+		},
+	}
+	require.NoError(t, app.DB.Create(settings).Error)
+
+	session := &models.ChatbotSession{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		PhoneNumber:     "919999999998",
+		Status:          models.SessionStatusActive,
+		SessionData:     models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(session).Error)
+
+	answer, err := app.generateAIResponse(settings, session, "random question")
+	require.NoError(t, err)
+	assert.Equal(t, "Please rephrase or use the menu.", answer)
+}
+
+func TestGenerateAIResponse_LocalOnlySkipsRAG(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required")
+	}
+	org, account := createProcessorTestOrg(t, app)
+
+	ragCalled := false
+	ragServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ragCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"answer": "from rag", "abstained": false})
+	}))
+	t.Cleanup(ragServer.Close)
+
+	require.NoError(t, app.DB.Create(&models.AIContext{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Darvi RAG",
+		ContextType:    models.ContextTypeRAG,
+		IsEnabled:      true,
+		ApiConfig:      models.JSONB{"url": ragServer.URL, "api_key": "k"},
+	}).Error)
+
+	// local_only with no working local provider → error / empty path, not RAG
+	settings := &models.ChatbotSettings{
+		OrganizationID: org.ID,
+		AI: models.AIConfig{
+			Enabled:      false,
+			FreeTextMode: models.FreeTextAILocalOnly,
+		},
+	}
+	session := &models.ChatbotSession{
+		OrganizationID:  org.ID,
+		WhatsAppAccount: account.Name,
+		SessionData:     models.JSONB{},
+	}
+	_, err := app.generateAIResponse(settings, session, "what the company does")
+	require.Error(t, err)
+	assert.False(t, ragCalled)
+}
+
+func TestCanAttemptAI_RespectsFreeTextModeOff(t *testing.T) {
+	app := newProcessorTestApp(t)
+	if app.Redis == nil {
+		t.Skip("Redis required")
+	}
+	org, _ := createProcessorTestOrg(t, app)
+
+	require.NoError(t, app.DB.Create(&models.AIContext{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "rag",
+		ContextType:    models.ContextTypeRAG,
+		IsEnabled:      true,
+		ApiConfig:      models.JSONB{"url": "https://example.com/chat"},
+	}).Error)
+
+	settings := &models.ChatbotSettings{
+		OrganizationID: org.ID,
+		AI: models.AIConfig{
+			Enabled:      true,
+			Provider:     models.AIProviderOpenRouter,
+			APIKey:       "k",
+			FreeTextMode: models.FreeTextAIOff,
+		},
+	}
+	assert.False(t, app.canAttemptAI(settings, ""))
+}
+
 func TestBuildAIContext_SkipsRAGType(t *testing.T) {
 	app := newProcessorTestApp(t)
 	if app.Redis == nil {

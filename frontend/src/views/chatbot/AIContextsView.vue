@@ -218,13 +218,19 @@ async function toggleContext(context: AIContext) {
                 </template>
                 <template #cell-trigger_keywords="{ item: context }">
                   <div class="flex flex-wrap gap-1">
-                    <Badge v-for="kw in context.trigger_keywords?.slice(0, 2)" :key="kw" variant="secondary" class="text-xs">
-                      {{ kw }}
-                    </Badge>
-                    <Badge v-if="context.trigger_keywords?.length > 2" variant="outline" class="text-xs">
-                      +{{ context.trigger_keywords.length - 2 }}
-                    </Badge>
-                    <span v-if="!context.trigger_keywords?.length" class="text-muted-foreground text-sm">{{ $t('aiContexts.always') }}</span>
+                    <!-- RAG free-text always matches; show Always for clarity -->
+                    <template v-if="context.context_type === 'rag'">
+                      <Badge variant="secondary" class="text-xs">{{ $t('aiContexts.always') }}</Badge>
+                    </template>
+                    <template v-else>
+                      <Badge v-for="kw in context.trigger_keywords?.slice(0, 2)" :key="kw" variant="secondary" class="text-xs">
+                        {{ kw }}
+                      </Badge>
+                      <Badge v-if="context.trigger_keywords?.length > 2" variant="outline" class="text-xs">
+                        +{{ context.trigger_keywords.length - 2 }}
+                      </Badge>
+                      <span v-if="!context.trigger_keywords?.length" class="text-muted-foreground text-sm">{{ $t('aiContexts.always') }}</span>
+                    </template>
                   </div>
                 </template>
                 <template #cell-priority="{ item: context }">

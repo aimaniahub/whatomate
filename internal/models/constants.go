@@ -172,6 +172,21 @@ const (
 	ContextTypeRAG ContextType = "rag"
 )
 
+// FreeTextAIMode controls how free-text (and ai_response nodes) choose
+// between external RAG and optional local LLM providers.
+type FreeTextAIMode string
+
+const (
+	// FreeTextAIOff: never call RAG or local LLM for free-text; use keywords/fallback.
+	FreeTextAIOff FreeTextAIMode = "off"
+	// FreeTextAIRAGOnly: only enabled RAG AI Contexts; never local OpenRouter/etc.
+	FreeTextAIRAGOnly FreeTextAIMode = "rag_only"
+	// FreeTextAIRAGThenLocal: try RAG first, then local LLM if configured.
+	FreeTextAIRAGThenLocal FreeTextAIMode = "rag_then_local"
+	// FreeTextAILocalOnly: skip RAG; only local LLM when ai_enabled.
+	FreeTextAILocalOnly FreeTextAIMode = "local_only"
+)
+
 // InputType represents chatbot flow step input types
 type InputType string
 

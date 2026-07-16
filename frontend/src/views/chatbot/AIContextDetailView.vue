@@ -272,7 +272,7 @@ onMounted(async () => {
           </p>
         </div>
 
-        <div class="space-y-1.5">
+        <div v-if="form.context_type !== 'rag'" class="space-y-1.5">
           <Label class="text-xs">{{ $t('aiContexts.triggerKeywords', 'Trigger Keywords') }}</Label>
           <Input
             v-model="form.trigger_keywords"
@@ -281,6 +281,17 @@ onMounted(async () => {
           <p class="text-xs text-muted-foreground">
             {{ $t('aiContexts.triggerKeywordsHint', 'Comma-separated. Leave empty to always trigger.') }}
           </p>
+        </div>
+        <div v-else class="space-y-1.5 rounded-md border border-border/60 bg-muted/30 px-3 py-2">
+          <p class="text-xs text-muted-foreground">
+            {{ $t('aiContexts.ragKeywordsHint', 'For RAG, free-text always calls this context (keywords are not required). Leave empty.') }}
+          </p>
+          <Label class="text-xs text-muted-foreground">{{ $t('aiContexts.ragKeywordsAdvanced', 'Advanced: optional labels (not used to gate free-text RAG)') }}</Label>
+          <Input
+            v-model="form.trigger_keywords"
+            :placeholder="$t('aiContexts.triggerKeywordsPlaceholder', 'optional')"
+            class="text-xs"
+          />
         </div>
 
         <div v-if="form.context_type !== 'rag'" class="space-y-1.5">

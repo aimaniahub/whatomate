@@ -130,10 +130,22 @@ const aiSettings = ref({
   ai_api_key: '',
   ai_model: '',
   ai_max_tokens: 500,
-  ai_system_prompt: ''
+  ai_system_prompt: '',
+  ai_free_text_mode: 'rag_only' as string
 })
 
 const isAIEnabled = ref(false)
+
+const freeTextModes = [
+  { value: 'rag_only', labelKey: 'chatbotSettings.freeTextModeRagOnly', descKey: 'chatbotSettings.freeTextModeRagOnlyDesc' },
+  { value: 'rag_then_local', labelKey: 'chatbotSettings.freeTextModeRagThenLocal', descKey: 'chatbotSettings.freeTextModeRagThenLocalDesc' },
+  { value: 'local_only', labelKey: 'chatbotSettings.freeTextModeLocalOnly', descKey: 'chatbotSettings.freeTextModeLocalOnlyDesc' },
+  { value: 'off', labelKey: 'chatbotSettings.freeTextModeOff', descKey: 'chatbotSettings.freeTextModeOffDesc' }
+]
+
+const showLocalLLMBlock = computed(() =>
+  aiSettings.value.ai_free_text_mode === 'rag_then_local' || aiSettings.value.ai_free_text_mode === 'local_only'
+)
 
 const aiProviders = [
   { value: 'openai', label: 'OpenAI', models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'] },
@@ -233,13 +245,15 @@ onMounted(async () => {
 
       const aiEnabledValue = chatbotData.settings.ai_enabled === true
       isAIEnabled.value = aiEnabledValue
+      const freeTextMode = chatbotData.settings.ai_free_text_mode || 'rag_only'
       aiSettings.value = {
         ai_enabled: aiEnabledValue,
         ai_provider: chatbotData.settings.ai_provider || '',
         ai_api_key: '',
         ai_model: chatbotData.settings.ai_model || '',
         ai_max_tokens: chatbotData.settings.ai_max_tokens || 500,
-        ai_system_prompt: chatbotData.settings.ai_system_prompt || ''
+        ai_system_prompt: chatbotData.settings.ai_system_prompt || '',
+        ai_free_text_mode: freeTextMode
       }
 
       const slaEnabledValue = chatbotData.settings.sla_enabled === true
@@ -337,12 +351,21 @@ async function saveBusinessHoursSettings() {
 async function saveAISettings() {
   isSubmitting.value = true
   try {
+    // RAG-only / off never need local LLM for free-text; force ai_enabled off so
+    // OpenRouter cannot invent answers even if credentials remain in the DB.
+    const mode = aiSettings.value.ai_free_text_mode
+    const localAllowed = mode === 'rag_then_local' || mode === 'local_only'
+    if (!localAllowed) {
+      isAIEnabled.value = false
+      aiSettings.value.ai_enabled = false
+    }
     const payload: any = {
-      ai_enabled: aiSettings.value.ai_enabled,
+      ai_enabled: localAllowed && aiSettings.value.ai_enabled,
       ai_provider: aiSettings.value.ai_provider,
       ai_model: aiSettings.value.ai_model,
       ai_max_tokens: aiSettings.value.ai_max_tokens,
-      ai_system_prompt: aiSettings.value.ai_system_prompt
+      ai_system_prompt: aiSettings.value.ai_system_prompt,
+      ai_free_text_mode: mode
     }
     if (aiSettings.value.ai_api_key) {
       payload.ai_api_key = aiSettings.value.ai_api_key
@@ -889,18 +912,58 @@ function removeEscalationUser(userId: string) {
                 <CardDescription>{{ $t('chatbotSettings.aiSettingsDesc') }}</CardDescription>
               </CardHeader>
               <CardContent class="space-y-4">
+                <!-- Free-text answer mode (RAG vs optional local LLM) -->
+                <div class="space-y-2">
+                  <Label>{{ $t('chatbotSettings.freeTextMode') }}</Label>
+                  <Select v-model="aiSettings.ai_free_text_mode">
+                    <SelectTrigger>
+                      <SelectValue :placeholder="$t('chatbotSettings.freeTextMode') + '...'" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="m in freeTextModes" :key="m.value" :value="m.value">
+                        {{ $t(m.labelKey) }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p class="text-sm text-muted-foreground">
+                    {{ $t(freeTextModes.find(m => m.value === aiSettings.ai_free_text_mode)?.descKey || 'chatbotSettings.freeTextModeRagOnlyDesc') }}
+                  </p>
+                  <p class="text-xs text-muted-foreground">
+                    {{ $t('chatbotSettings.ragContextsHint') }}
+                    <RouterLink to="/chatbot/ai" class="text-primary underline underline-offset-2">
+                      {{ $t('chatbotSettings.manageAiContexts') }}
+                    </RouterLink>
+                  </p>
+                  <p
+                    v-if="aiSettings.ai_free_text_mode === 'rag_only' || aiSettings.ai_free_text_mode === 'rag_then_local'"
+                    class="text-xs rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-200 light:text-amber-800 light:bg-amber-50"
+                  >
+                    {{ $t('chatbotSettings.ragOnlyRequiresContext') }}
+                  </p>
+                </div>
+
+                <Separator />
+
+                <!-- Optional local LLM -->
                 <div class="flex items-center justify-between">
                   <div>
-                    <p class="font-medium">{{ $t('chatbotSettings.enableAiResponses') }}</p>
-                    <p class="text-sm text-muted-foreground">{{ $t('chatbotSettings.enableAiResponsesDesc') }}</p>
+                    <p class="font-medium">{{ $t('chatbotSettings.enableLocalLlm') }}</p>
+                    <p class="text-sm text-muted-foreground">{{ $t('chatbotSettings.enableLocalLlmDesc') }}</p>
                   </div>
                   <Switch
                     :checked="isAIEnabled"
+                    :disabled="aiSettings.ai_free_text_mode === 'rag_only' || aiSettings.ai_free_text_mode === 'off'"
                     @update:checked="(val: boolean) => isAIEnabled = val"
                   />
                 </div>
+                <p
+                  v-if="aiSettings.ai_free_text_mode === 'rag_only'"
+                  class="text-xs text-muted-foreground"
+                >
+                  {{ $t('chatbotSettings.localLlmDisabledByRagOnly') }}
+                </p>
 
-                <div v-if="isAIEnabled" class="space-y-4 pt-2">
+                <div v-if="isAIEnabled && showLocalLLMBlock" class="space-y-4 pt-2">
                   <Separator />
 
                   <div class="grid grid-cols-2 gap-4">

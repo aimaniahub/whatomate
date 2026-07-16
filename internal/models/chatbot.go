@@ -53,6 +53,9 @@ type AIConfig struct {
 	SystemPrompt   string     `gorm:"column:ai_system_prompt;type:text" json:"ai_system_prompt"`
 	IncludeHistory bool       `gorm:"column:ai_include_history;default:true" json:"ai_include_history"`
 	HistoryLimit   int        `gorm:"column:ai_history_limit;default:4" json:"ai_history_limit"`
+	// FreeTextMode controls free-text / ai_response routing between RAG and local LLM.
+	// Empty means resolve via ResolveFreeTextMode (migration-safe default).
+	FreeTextMode FreeTextAIMode `gorm:"column:ai_free_text_mode;size:30;default:''" json:"ai_free_text_mode"`
 }
 
 // PanelFieldConfig defines a field to display in the contact info panel
