@@ -239,12 +239,19 @@ func (a *App) UpdateTeam(r *fastglue.Request) error {
 		return nil
 	}
 
+	body := r.RequestCtx.PostBody()
+
 	// Update fields
 	if req.Name != "" {
 		team.Name = req.Name
 	}
-	team.Description = req.Description
-	team.IsActive = req.IsActive
+	// Description always applied when present so empty string can clear it
+	if jsonFieldPresent(body, "description") {
+		team.Description = req.Description
+	}
+	if active := jsonBoolPtr(body, "is_active"); active != nil {
+		team.IsActive = *active
+	}
 
 	if req.AssignmentStrategy != "" {
 		if req.AssignmentStrategy != models.AssignmentStrategyRoundRobin && req.AssignmentStrategy != models.AssignmentStrategyLoadBalanced && req.AssignmentStrategy != models.AssignmentStrategyManual {
@@ -252,7 +259,9 @@ func (a *App) UpdateTeam(r *fastglue.Request) error {
 		}
 		team.AssignmentStrategy = req.AssignmentStrategy
 	}
-	team.PerAgentTimeoutSecs = req.PerAgentTimeoutSecs
+	if jsonFieldPresent(body, "per_agent_timeout_secs") {
+		team.PerAgentTimeoutSecs = req.PerAgentTimeoutSecs
+	}
 	team.UpdatedByID = &userID
 
 	if err := a.DB.Save(&team).Error; err != nil {

@@ -263,6 +263,8 @@ func (a *App) UpdateWebhook(r *fastglue.Request) error {
 		return nil
 	}
 
+	body := r.RequestCtx.PostBody()
+
 	if req.Name != "" {
 		webhook.Name = req.Name
 	}
@@ -272,7 +274,11 @@ func (a *App) UpdateWebhook(r *fastglue.Request) error {
 		}
 		webhook.URL = req.URL
 	}
-	if len(req.Events) > 0 {
+	// Present (including []) replaces events; omit leaves existing events.
+	if jsonFieldPresent(body, "events") {
+		if len(req.Events) == 0 {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "at least one event must be selected", nil, "")
+		}
 		webhook.Events = req.Events
 	}
 
@@ -285,12 +291,14 @@ func (a *App) UpdateWebhook(r *fastglue.Request) error {
 		webhook.Headers = headers
 	}
 
-	// Update secret if provided (empty string clears it)
-	if req.Secret != "" {
+	// secret present: set (non-empty) or clear (empty string)
+	if jsonFieldPresent(body, "secret") {
 		webhook.Secret = req.Secret
 	}
 
-	webhook.IsActive = req.IsActive
+	if active := jsonBoolPtr(body, "is_active"); active != nil {
+		webhook.IsActive = *active
+	}
 
 	if err := a.DB.Save(webhook).Error; err != nil {
 		a.Log.Error("Failed to update webhook", "error", err)

@@ -206,12 +206,14 @@ func (a *App) UpdateCustomAction(r *fastglue.Request) error {
 		return nil
 	}
 
-	// Build updates
+	body := r.RequestCtx.PostBody()
+
+	// Build updates — only fields present in the body (partial-update safe)
 	updates := map[string]any{}
 	if req.Name != "" {
 		updates["name"] = req.Name
 	}
-	if req.Icon != "" {
+	if jsonFieldPresent(body, "icon") {
 		updates["icon"] = req.Icon
 	}
 	if req.ActionType != "" {
@@ -231,8 +233,16 @@ func (a *App) UpdateCustomAction(r *fastglue.Request) error {
 		configJSON, _ := json.Marshal(req.Config)
 		updates["config"] = configJSON
 	}
-	updates["is_active"] = req.IsActive
-	updates["display_order"] = req.DisplayOrder
+	if active := jsonBoolPtr(body, "is_active"); active != nil {
+		updates["is_active"] = *active
+	}
+	if jsonFieldPresent(body, "display_order") {
+		updates["display_order"] = req.DisplayOrder
+	}
+
+	if len(updates) == 0 {
+		return r.SendEnvelope(customActionToResponse(*action))
+	}
 
 	if err := a.DB.Model(action).Updates(updates).Error; err != nil {
 		a.Log.Error("Failed to update custom action", "error", err)

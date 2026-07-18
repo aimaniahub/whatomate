@@ -240,17 +240,21 @@ func (a *App) UpdateRole(r *fastglue.Request) error {
 		return nil
 	}
 
+	body := r.RequestCtx.PostBody()
+	descriptionPresent := jsonFieldPresent(body, "description")
+	permissionsPresent := jsonFieldPresent(body, "permissions")
+
 	if role.IsSystem {
 		// Check if user is super admin
 		isSuperAdmin, _ := r.RequestCtx.UserValue("is_super_admin").(bool)
 
-		// Only allow description updates for non-super admins
-		if req.Description != "" {
+		// Only allow description updates for non-super admins (empty string clears)
+		if descriptionPresent {
 			role.Description = req.Description
 		}
 
-		// Super admins can update permissions for system roles
-		if isSuperAdmin && len(req.Permissions) > 0 {
+		// Super admins can replace permissions for system roles (including clear to [])
+		if isSuperAdmin && permissionsPresent {
 			permissions, err := a.getPermissionsByKeys(req.Permissions)
 			if err != nil {
 				a.Log.Error("Failed to fetch permissions", "error", err)
@@ -288,18 +292,17 @@ func (a *App) UpdateRole(r *fastglue.Request) error {
 		}
 		role.Name = req.Name
 	}
-	if req.Description != "" {
+	if descriptionPresent {
 		role.Description = req.Description
 	}
 
-	// Update permissions if provided
-	if len(req.Permissions) > 0 {
+	// Replace permissions when field is present (including empty list)
+	if permissionsPresent {
 		permissions, err := a.getPermissionsByKeys(req.Permissions)
 		if err != nil {
 			a.Log.Error("Failed to fetch permissions", "error", err)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update role", nil, "")
 		}
-		// Replace associations
 		if err := a.DB.Model(&role).Association("Permissions").Replace(permissions); err != nil {
 			a.Log.Error("Failed to update role permissions", "error", err)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update role", nil, "")

@@ -210,17 +210,28 @@ func (a *App) UpdateCannedResponse(r *fastglue.Request) error {
 
 	oldSnap := cannedResponseAuditSnapshot(&cannedResponse)
 
+	body := r.RequestCtx.PostBody()
+
 	// Update fields
 	if req.Name != "" {
 		cannedResponse.Name = req.Name
 	}
-	cannedResponse.Shortcut = req.Shortcut
-	if req.Content != "" {
+	if jsonFieldPresent(body, "shortcut") {
+		cannedResponse.Shortcut = req.Shortcut
+	}
+	// Content present (including empty) allows clear
+	if jsonFieldPresent(body, "content") {
 		cannedResponse.Content = req.Content
 	}
-	cannedResponse.Category = req.Category
-	cannedResponse.IsActive = req.IsActive
-	cannedResponse.Buttons = buttonsToJSONBArray(req.Buttons)
+	if jsonFieldPresent(body, "category") {
+		cannedResponse.Category = req.Category
+	}
+	if active := jsonBoolPtr(body, "is_active"); active != nil {
+		cannedResponse.IsActive = *active
+	}
+	if jsonFieldPresent(body, "buttons") {
+		cannedResponse.Buttons = buttonsToJSONBArray(req.Buttons)
+	}
 
 	if err := a.DB.Save(&cannedResponse).Error; err != nil {
 		a.Log.Error("Failed to update canned response", "error", err)

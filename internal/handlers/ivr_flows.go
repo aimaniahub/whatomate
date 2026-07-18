@@ -235,25 +235,34 @@ func (a *App) UpdateIVRFlow(r *fastglue.Request) error {
 		}
 	}
 
-	// Only update fields that were actually provided (non-zero) to support
-	// partial updates like toggling is_active without wiping the menu.
+	body := r.RequestCtx.PostBody()
+
+	// Only update fields that were actually provided to support partial updates
+	// (e.g. toggling is_active without wiping the menu).
 	updates := map[string]any{
-		"is_active":       req.IsActive,
-		"is_call_start":   req.IsCallStart,
-		"is_outgoing_end": req.IsOutgoingEnd,
-		"updated_by_id":   userID,
+		"updated_by_id": userID,
+	}
+	if active := jsonBoolPtr(body, "is_active"); active != nil {
+		updates["is_active"] = *active
+	}
+	if callStart := jsonBoolPtr(body, "is_call_start"); callStart != nil {
+		updates["is_call_start"] = *callStart
+	}
+	if outgoingEnd := jsonBoolPtr(body, "is_outgoing_end"); outgoingEnd != nil {
+		updates["is_outgoing_end"] = *outgoingEnd
 	}
 	if req.Name != "" {
 		updates["name"] = req.Name
 	}
-	if req.Description != "" || req.Name != "" {
-		// Include description when saving from the editor (name is always sent)
+	// Description: present in body (including empty) clears/sets it
+	if jsonFieldPresent(body, "description") {
 		updates["description"] = req.Description
 	}
 	if req.Menu != nil {
 		updates["menu"] = req.Menu
 	}
-	if req.WelcomeAudioURL != "" {
+	// Empty welcome_audio_url clears the audio
+	if jsonFieldPresent(body, "welcome_audio_url") {
 		updates["welcome_audio_url"] = req.WelcomeAudioURL
 	}
 	if req.WhatsAppAccount != "" {

@@ -452,15 +452,22 @@ func (a *App) UpdateSSOProvider(r *fastglue.Request) error {
 		}
 	}
 
+	body := r.RequestCtx.PostBody()
+
 	// Update fields
 	ssoConfig.ClientID = req.ClientID
-	if req.ClientSecret != "" {
-		enc, err := appcrypto.Encrypt(req.ClientSecret, a.Config.App.EncryptionKey)
-		if err != nil {
-			a.Log.Error("Failed to encrypt SSO client secret", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save SSO configuration", nil, "")
+	// client_secret present: non-empty encrypts & sets; empty string clears
+	if jsonFieldPresent(body, "client_secret") {
+		if req.ClientSecret == "" {
+			ssoConfig.ClientSecret = ""
+		} else {
+			enc, err := appcrypto.Encrypt(req.ClientSecret, a.Config.App.EncryptionKey)
+			if err != nil {
+				a.Log.Error("Failed to encrypt SSO client secret", "error", err)
+				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save SSO configuration", nil, "")
+			}
+			ssoConfig.ClientSecret = enc
 		}
-		ssoConfig.ClientSecret = enc
 	}
 	ssoConfig.IsEnabled = req.IsEnabled
 	ssoConfig.AllowAutoCreate = req.AllowAutoCreate

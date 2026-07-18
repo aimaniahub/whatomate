@@ -48,6 +48,8 @@ type ChatbotSettingsResponse struct {
 	ClientReminderMessage  string `json:"client_reminder_message"`
 	ClientAutoCloseMinutes int    `json:"client_auto_close_minutes"`
 	ClientAutoCloseMessage string `json:"client_auto_close_message"`
+	// Phone numbers that skip automated chatbot processing
+	ExcludedNumbers []string `json:"excluded_numbers"`
 }
 
 // ChatbotStatsResponse represents chatbot statistics
@@ -66,6 +68,7 @@ type ChatbotStatsResponse struct {
 type KeywordRuleResponse struct {
 	ID              string              `json:"id"`
 	Name            string              `json:"name"`
+	WhatsAppAccount string              `json:"whatsapp_account"`
 	Keywords        []string            `json:"keywords"`
 	MatchType       models.MatchType    `json:"match_type"`
 	ResponseType    models.ResponseType `json:"response_type"`
@@ -83,7 +86,9 @@ type ChatbotFlowResponse struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
 	Description     string   `json:"description"`
+	WhatsAppAccount string   `json:"whatsapp_account"`
 	TriggerKeywords []string `json:"trigger_keywords"`
+	CancelKeywords  []string `json:"cancel_keywords"`
 	Enabled         bool     `json:"enabled"`
 	CreatedAt       string   `json:"created_at"`
 }
@@ -194,12 +199,30 @@ func (a *App) GetChatbotSettings(r *fastglue.Request) error {
 		ClientReminderMessage:  settings.ClientInactivity.ReminderMessage,
 		ClientAutoCloseMinutes: settings.ClientInactivity.AutoCloseMinutes,
 		ClientAutoCloseMessage: settings.ClientInactivity.AutoCloseMessage,
+		ExcludedNumbers:        jsonbArrayToStringSlice(settings.ExcludedNumbers),
 	}
 
 	return r.SendEnvelope(map[string]any{
 		"settings": settingsResp,
 		"stats":    stats,
 	})
+}
+
+// jsonbArrayToStringSlice converts JSONBArray of string-ish values to []string.
+func jsonbArrayToStringSlice(arr models.JSONBArray) []string {
+	if len(arr) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		switch t := v.(type) {
+		case string:
+			if s := strings.TrimSpace(t); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // UpdateChatbotSettings updates chatbot settings
@@ -252,6 +275,37 @@ func chatbotSLASnapshot(s *models.ChatbotSettings) map[string]any {
 		"client_auto_close_minutes": s.ClientInactivity.AutoCloseMinutes,
 		"client_auto_close_message": s.ClientInactivity.AutoCloseMessage,
 	}
+}
+
+// sanitizeKeywordList trims entries and drops blanks so empty UI fields
+// do not leave ghost trigger keywords in the database.
+func sanitizeKeywordList(in []string) models.StringArray {
+	if in == nil {
+		return nil
+	}
+	out := make(models.StringArray, 0, len(in))
+	for _, k := range in {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// normalizeKeywordResponseContent copies "text" → "body" when body is empty
+// so older/client variants still produce a runtime response.
+func normalizeKeywordResponseContent(content map[string]any) map[string]any {
+	if content == nil {
+		return nil
+	}
+	body, _ := content["body"].(string)
+	if strings.TrimSpace(body) == "" {
+		if text, ok := content["text"].(string); ok && strings.TrimSpace(text) != "" {
+			content["body"] = text
+		}
+	}
+	return content
 }
 
 // chatbotAISnapshot captures the fields shown on the Chatbot "AI" tab.
@@ -310,6 +364,8 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 		ClientReminderMessage  *string `json:"client_reminder_message"`
 		ClientAutoCloseMinutes *int    `json:"client_auto_close_minutes"`
 		ClientAutoCloseMessage *string `json:"client_auto_close_message"`
+		// Numbers that should skip automated chatbot processing
+		ExcludedNumbers *[]string `json:"excluded_numbers"`
 	}
 
 	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
@@ -420,7 +476,8 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	if req.AIProvider != nil {
 		settings.AI.Provider = *req.AIProvider
 	}
-	if req.AIAPIKey != nil && *req.AIAPIKey != "" {
+	// Present AI API key: non-empty sets, empty string clears
+	if req.AIAPIKey != nil {
 		settings.AI.APIKey = *req.AIAPIKey
 	}
 	if req.AIModel != nil {
@@ -483,6 +540,16 @@ func (a *App) UpdateChatbotSettings(r *fastglue.Request) error {
 	}
 	if req.ClientAutoCloseMessage != nil {
 		settings.ClientInactivity.AutoCloseMessage = *req.ClientAutoCloseMessage
+	}
+	if req.ExcludedNumbers != nil {
+		excluded := make([]any, 0, len(*req.ExcludedNumbers))
+		for _, n := range *req.ExcludedNumbers {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				excluded = append(excluded, n)
+			}
+		}
+		settings.ExcludedNumbers = excluded
 	}
 
 	if err := a.DB.Save(&settings).Error; err != nil {
@@ -585,6 +652,7 @@ func (a *App) ListKeywordRules(r *fastglue.Request) error {
 		resp := KeywordRuleResponse{
 			ID:              rule.ID.String(),
 			Name:            rule.Name,
+			WhatsAppAccount: rule.WhatsAppAccount,
 			Keywords:        rule.Keywords,
 			MatchType:       rule.MatchType,
 			ResponseType:    rule.ResponseType,
@@ -620,6 +688,7 @@ func (a *App) CreateKeywordRule(r *fastglue.Request) error {
 
 	var req struct {
 		Name            string              `json:"name"`
+		WhatsAppAccount string              `json:"whatsapp_account"`
 		Keywords        []string            `json:"keywords"`
 		MatchType       models.MatchType    `json:"match_type"`
 		ResponseType    models.ResponseType `json:"response_type"`
@@ -632,7 +701,8 @@ func (a *App) CreateKeywordRule(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
 	}
 
-	if len(req.Keywords) == 0 {
+	keywords := sanitizeKeywordList(req.Keywords)
+	if len(keywords) == 0 {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "At least one keyword is required", nil, "")
 	}
 
@@ -644,14 +714,18 @@ func (a *App) CreateKeywordRule(r *fastglue.Request) error {
 		req.ResponseType = models.ResponseTypeText
 	}
 	if req.Name == "" {
-		req.Name = req.Keywords[0]
+		req.Name = keywords[0]
 	}
+
+	// Normalize response_content so runtime can always read "body"
+	req.ResponseContent = normalizeKeywordResponseContent(req.ResponseContent)
 
 	rule := models.KeywordRule{
 		BaseModel:       models.BaseModel{ID: uuid.New()},
 		OrganizationID:  orgID,
+		WhatsAppAccount: req.WhatsAppAccount, // empty = all accounts
 		Name:            req.Name,
-		Keywords:        req.Keywords,
+		Keywords:        keywords,
 		MatchType:       req.MatchType,
 		ResponseType:    req.ResponseType,
 		ResponseContent: models.JSONB(req.ResponseContent),
@@ -700,6 +774,7 @@ func (a *App) GetKeywordRule(r *fastglue.Request) error {
 	response := KeywordRuleResponse{
 		ID:              rule.ID.String(),
 		Name:            rule.Name,
+		WhatsAppAccount: rule.WhatsAppAccount,
 		Keywords:        rule.Keywords,
 		MatchType:       rule.MatchType,
 		ResponseType:    rule.ResponseType,
@@ -741,6 +816,7 @@ func (a *App) UpdateKeywordRule(r *fastglue.Request) error {
 
 	var req struct {
 		Name            *string              `json:"name"`
+		WhatsAppAccount *string              `json:"whatsapp_account"`
 		Keywords        []string             `json:"keywords"`
 		MatchType       *models.MatchType    `json:"match_type"`
 		ResponseType    *models.ResponseType `json:"response_type"`
@@ -757,8 +833,12 @@ func (a *App) UpdateKeywordRule(r *fastglue.Request) error {
 	if req.Name != nil {
 		rule.Name = *req.Name
 	}
-	if len(req.Keywords) > 0 {
-		rule.Keywords = req.Keywords
+	if req.WhatsAppAccount != nil {
+		rule.WhatsAppAccount = *req.WhatsAppAccount
+	}
+	// nil = omitted (e.g. toggle enabled only); non-nil including [] = set/clear keywords.
+	if req.Keywords != nil {
+		rule.Keywords = sanitizeKeywordList(req.Keywords)
 	}
 	if req.MatchType != nil {
 		rule.MatchType = *req.MatchType
@@ -767,7 +847,7 @@ func (a *App) UpdateKeywordRule(r *fastglue.Request) error {
 		rule.ResponseType = *req.ResponseType
 	}
 	if req.ResponseContent != nil {
-		rule.ResponseContent = models.JSONB(req.ResponseContent)
+		rule.ResponseContent = models.JSONB(normalizeKeywordResponseContent(req.ResponseContent))
 	}
 	if req.Priority != nil {
 		rule.Priority = *req.Priority
@@ -780,6 +860,14 @@ func (a *App) UpdateKeywordRule(r *fastglue.Request) error {
 	if err := a.DB.Save(rule).Error; err != nil {
 		a.Log.Error("Failed to update keyword rule", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update keyword rule", nil, "")
+	}
+
+	// GORM can skip empty custom-type slices on Save; force-write when clearing.
+	if req.Keywords != nil && len(rule.Keywords) == 0 {
+		if err := a.DB.Model(rule).Update("keywords", models.StringArray{}).Error; err != nil {
+			a.Log.Error("Failed to clear keyword rule keywords", "error", err, "rule_id", rule.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update keyword rule", nil, "")
+		}
 	}
 
 	// Invalidate cache
@@ -863,7 +951,9 @@ func (a *App) ListChatbotFlows(r *fastglue.Request) error {
 			ID:              flow.ID.String(),
 			Name:            flow.Name,
 			Description:     flow.Description,
+			WhatsAppAccount: flow.WhatsAppAccount,
 			TriggerKeywords: flow.TriggerKeywords,
+			CancelKeywords:  flow.CancelKeywords,
 			Enabled:         flow.IsEnabled,
 			CreatedAt:       flow.CreatedAt.Format(time.RFC3339),
 		}
@@ -891,7 +981,9 @@ func (a *App) CreateChatbotFlow(r *fastglue.Request) error {
 	var req struct {
 		Name              string         `json:"name"`
 		Description       string         `json:"description"`
+		WhatsAppAccount   string         `json:"whatsapp_account"`
 		TriggerKeywords   []string       `json:"trigger_keywords"`
+		CancelKeywords    []string       `json:"cancel_keywords"`
 		InitialMessage    string         `json:"initial_message"`
 		CompletionMessage string         `json:"completion_message"`
 		OnCompleteAction  string         `json:"on_complete_action"`
@@ -912,9 +1004,11 @@ func (a *App) CreateChatbotFlow(r *fastglue.Request) error {
 	flow := models.ChatbotFlow{
 		BaseModel:         models.BaseModel{ID: uuid.New()},
 		OrganizationID:    orgID,
+		WhatsAppAccount:   req.WhatsAppAccount, // empty = all accounts in org
 		Name:              req.Name,
 		Description:       req.Description,
-		TriggerKeywords:   req.TriggerKeywords,
+		TriggerKeywords:   sanitizeKeywordList(req.TriggerKeywords),
+		CancelKeywords:    sanitizeKeywordList(req.CancelKeywords),
 		InitialMessage:    req.InitialMessage,
 		CompletionMessage: req.CompletionMessage,
 		OnCompleteAction:  req.OnCompleteAction,
@@ -995,7 +1089,9 @@ func (a *App) UpdateChatbotFlow(r *fastglue.Request) error {
 	var req struct {
 		Name              *string        `json:"name"`
 		Description       *string        `json:"description"`
+		WhatsAppAccount   *string        `json:"whatsapp_account"`
 		TriggerKeywords   []string       `json:"trigger_keywords"`
+		CancelKeywords    []string       `json:"cancel_keywords"`
 		InitialMessage    *string        `json:"initial_message"`
 		CompletionMessage *string        `json:"completion_message"`
 		OnCompleteAction  *string        `json:"on_complete_action"`
@@ -1015,8 +1111,16 @@ func (a *App) UpdateChatbotFlow(r *fastglue.Request) error {
 	if req.Description != nil {
 		flow.Description = *req.Description
 	}
-	if len(req.TriggerKeywords) > 0 {
-		flow.TriggerKeywords = req.TriggerKeywords
+	if req.WhatsAppAccount != nil {
+		flow.WhatsAppAccount = *req.WhatsAppAccount
+	}
+	// nil = field omitted (partial update, e.g. toggle enabled only).
+	// non-nil (including []) = caller explicitly set keywords — allow clear.
+	if req.TriggerKeywords != nil {
+		flow.TriggerKeywords = sanitizeKeywordList(req.TriggerKeywords)
+	}
+	if req.CancelKeywords != nil {
+		flow.CancelKeywords = sanitizeKeywordList(req.CancelKeywords)
 	}
 	if req.InitialMessage != nil {
 		flow.InitialMessage = *req.InitialMessage
@@ -1044,6 +1148,21 @@ func (a *App) UpdateChatbotFlow(r *fastglue.Request) error {
 	if err := a.DB.Save(flow).Error; err != nil {
 		a.Log.Error("Failed to update flow", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update flow", nil, "")
+	}
+
+	// GORM can skip empty custom-type slices on Save; force-write when clearing.
+	forceSlice := map[string]any{}
+	if req.TriggerKeywords != nil && len(flow.TriggerKeywords) == 0 {
+		forceSlice["trigger_keywords"] = models.StringArray{}
+	}
+	if req.CancelKeywords != nil && len(flow.CancelKeywords) == 0 {
+		forceSlice["cancel_keywords"] = models.StringArray{}
+	}
+	if len(forceSlice) > 0 {
+		if err := a.DB.Model(flow).Updates(forceSlice).Error; err != nil {
+			a.Log.Error("Failed to clear flow keyword fields", "error", err, "flow_id", flow.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update flow", nil, "")
+		}
 	}
 
 	a.InvalidateChatbotFlowsCache(orgID)
@@ -1074,7 +1193,9 @@ func (a *App) DeleteChatbotFlow(r *fastglue.Request) error {
 
 	// Load flow for audit before deleting
 	var flowForAudit models.ChatbotFlow
-	a.DB.Where("id = ? AND organization_id = ?", id, orgID).First(&flowForAudit)
+	if err := a.DB.Where("id = ? AND organization_id = ?", id, orgID).First(&flowForAudit).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Flow not found", nil, "")
+	}
 
 	// Delete steps first (legacy, outside transaction so it doesn't poison tx if it fails)
 	if err := a.DB.Exec("DELETE FROM chatbot_flow_steps WHERE flow_id = ?", id).Error; err != nil {
@@ -1084,7 +1205,7 @@ func (a *App) DeleteChatbotFlow(r *fastglue.Request) error {
 	// Delete flow in transaction
 	tx := a.DB.Begin()
 
-	// Delete flow
+	// Delete flow (soft-delete via DeletedAt)
 	result := tx.Where("id = ? AND organization_id = ?", id, orgID).Delete(&models.ChatbotFlow{})
 	if result.Error != nil {
 		tx.Rollback()
@@ -1096,9 +1217,30 @@ func (a *App) DeleteChatbotFlow(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Flow not found", nil, "")
 	}
 
-	tx.Commit()
+	// End any active sessions still parked on this flow so inbound WhatsApp
+	// messages stop resuming a deleted graph.
+	now := time.Now()
+	if err := tx.Model(&models.ChatbotSession{}).
+		Where("organization_id = ? AND current_flow_id = ? AND status = ?",
+			orgID, id, models.SessionStatusActive).
+		Updates(map[string]any{
+			"status":          models.SessionStatusCompleted,
+			"current_flow_id": nil,
+			"current_step":    "",
+			"step_retries":    0,
+			"completed_at":    now,
+		}).Error; err != nil {
+		tx.Rollback()
+		a.Log.Error("Failed to complete sessions for deleted flow", "error", err, "flow_id", id)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete flow", nil, "")
+	}
 
-	// Invalidate cache
+	if err := tx.Commit().Error; err != nil {
+		a.Log.Error("Failed to commit flow delete", "error", err, "flow_id", id)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete flow", nil, "")
+	}
+
+	// Invalidate runtime match cache so deleted triggers stop firing immediately
 	a.InvalidateChatbotFlowsCache(orgID)
 
 	audit.LogAudit(a.DB, orgID, userID, audit.GetUserName(a.DB, userID),
@@ -1216,7 +1358,7 @@ func (a *App) CreateAIContext(r *fastglue.Request) error {
 		OrganizationID:  orgID,
 		Name:            req.Name,
 		ContextType:     req.ContextType,
-		TriggerKeywords: req.TriggerKeywords,
+		TriggerKeywords: sanitizeKeywordList(req.TriggerKeywords),
 		StaticContent:   req.StaticContent,
 		ApiConfig:       req.ApiConfig,
 		Priority:        req.Priority,
@@ -1328,7 +1470,7 @@ func (a *App) UpdateAIContext(r *fastglue.Request) error {
 		}
 	}
 	if req.TriggerKeywords != nil {
-		aiCtx.TriggerKeywords = req.TriggerKeywords
+		aiCtx.TriggerKeywords = sanitizeKeywordList(req.TriggerKeywords)
 	}
 	if req.StaticContent != nil {
 		aiCtx.StaticContent = *req.StaticContent
@@ -1357,6 +1499,13 @@ func (a *App) UpdateAIContext(r *fastglue.Request) error {
 	if err := a.DB.Save(aiCtx).Error; err != nil {
 		a.Log.Error("Failed to update AI context", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update AI context", nil, "")
+	}
+
+	if req.TriggerKeywords != nil && len(aiCtx.TriggerKeywords) == 0 {
+		if err := a.DB.Model(aiCtx).Update("trigger_keywords", models.StringArray{}).Error; err != nil {
+			a.Log.Error("Failed to clear AI context trigger keywords", "error", err, "id", aiCtx.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update AI context", nil, "")
+		}
 	}
 
 	// Invalidate cache

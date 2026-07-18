@@ -345,6 +345,12 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled)
 		return
 	}
+	// Skip automation for numbers on the exclusion list (still saved the inbound above)
+	if isPhoneExcluded(contact.PhoneNumber, settings.ExcludedNumbers) {
+		a.Log.Info("Contact phone is excluded from chatbot automation",
+			"contact_id", contact.ID, "phone", contact.PhoneNumber)
+		return
+	}
 	a.Log.Info("Chatbot settings loaded", "settings_id", settings.ID, "is_enabled", settings.IsEnabled, "ai_enabled", settings.AI.Enabled, "ai_provider", settings.AI.Provider, "default_response", settings.DefaultResponse)
 
 	// Check business hours if enabled
@@ -421,125 +427,136 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 			return
 		}
 
-		// Dynamic Buttons Node Breakout / Fallback logic:
-		// If the user typed free text (buttonID is empty) at a buttons node, we try to:
-		// 1. Check if the message matches another flow trigger keyword.
-		// 2. Check if the message matches a keyword rule (non-transfer).
-		// 3. Fallback to AI if configured, answer the query, and re-send the buttons.
-		if buttonID == "" {
-			graph, err := parseChatGraph(flow.Graph)
-			if err == nil && graph != nil {
-				node := graph.getNode(session.CurrentStep)
-				if node != nil && node.Type == ChatNodeButtons {
-					// 1. Try to match trigger keywords for a different flow
-					if nextFlow := a.matchFlowTrigger(account.OrganizationID, messageText); nextFlow != nil && nextFlow.ID != flow.ID {
-						a.Log.Info("Active buttons node breakout to different flow", "from_flow", flow.Name, "to_flow", nextFlow.Name)
-						session.CurrentFlowID = &nextFlow.ID
-						session.CurrentStep = ""
-						session.StepRetries = 0
-						session.SessionData = models.JSONB{
-							"_flow_id":   nextFlow.ID.String(),
-							"_flow_name": nextFlow.Name,
-						}
-						if err := a.runChatGraph(account, contact, session, nextFlow, messageText, buttonID, flowResponseData); err != nil {
-							a.Log.Error("Chat graph runner failed at flow start", "error", err, "session", session.ID, "flow", nextFlow.ID)
-						}
-						return
-					}
-
-					// 2. Try to match non-transfer keyword rules
-					if keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
-						a.Log.Info("Active buttons node breakout to keyword rule", "response", keywordResponse.Body)
-						if len(keywordResponse.Buttons) > 0 {
-							if err := a.sendAndSaveInteractiveButtons(account, contact, keywordResponse.Body, keywordResponse.Buttons); err != nil {
-								a.Log.Error("Failed to send breakout keyword buttons", "error", err)
+		// Cancel keywords exit the active flow; same message may then match
+		// another flow trigger / keyword rule / greeting below.
+		if messageMatchesAnyKeyword(messageText, flow.CancelKeywords) {
+			a.Log.Info("Cancel keyword matched; exiting flow",
+				"session", session.ID, "flow", flow.ID, "text", messageText)
+			a.exitFlow(session)
+			// Soft-reset in-memory session so fall-through treats this as free chat.
+			// exitFlow completed the DB row; open a fresh active session for routing.
+			session, isNewSession = a.getOrCreateSession(account.OrganizationID, contact.ID, account.Name, msg.From, settings.SessionTimeoutMins)
+		} else {
+			// Dynamic Buttons Node Breakout / Fallback logic:
+			// If the user typed free text (buttonID is empty) at a buttons node, we try to:
+			// 1. Check if the message matches another flow trigger keyword.
+			// 2. Check if the message matches a keyword rule (non-transfer).
+			// 3. Fallback to AI if configured, answer the query, and re-send the buttons.
+			if buttonID == "" {
+				graph, err := parseChatGraph(flow.Graph)
+				if err == nil && graph != nil {
+					node := graph.getNode(session.CurrentStep)
+					if node != nil && node.Type == ChatNodeButtons {
+						// 1. Try to match trigger keywords for a different flow
+						if nextFlow := a.matchFlowTrigger(account.OrganizationID, account.Name, messageText); nextFlow != nil && nextFlow.ID != flow.ID {
+							a.Log.Info("Active buttons node breakout to different flow", "from_flow", flow.Name, "to_flow", nextFlow.Name)
+							session.CurrentFlowID = &nextFlow.ID
+							session.CurrentStep = ""
+							session.StepRetries = 0
+							session.SessionData = models.JSONB{
+								"_flow_id":   nextFlow.ID.String(),
+								"_flow_name": nextFlow.Name,
 							}
-						} else {
-							if err := a.sendAndSaveTextMessage(account, contact, keywordResponse.Body); err != nil {
-								a.Log.Error("Failed to send breakout keyword text", "error", err)
-							}
-						}
-						a.logSessionMessage(session.ID, models.DirectionOutgoing, keywordResponse.Body, "keyword_response")
-
-						// Re-send the current buttons node menu so they are not stuck
-						bodyText := stringFromConfig(node.Config, "body", "message", "text")
-						if bodyText == "" {
-							bodyText = node.Label
-						}
-						bodyText = processTemplate(bodyText, session.SessionData)
-						btnList := buttonsFromConfig(node.Config)
-						for _, b := range btnList {
-							for _, key := range []string{"title", "url", "phone_number"} {
-								if s, ok := b[key].(string); ok && s != "" {
-									b[key] = processTemplate(s, session.SessionData)
-								}
-							}
-						}
-						if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
-							a.Log.Error("Failed to re-send buttons menu after keyword breakout", "error", err)
-						}
-						return
-					}
-
-					// Intercept contact query to bypass AI
-					if isContactOrLocationQuery(messageText) {
-						a.Log.Info("Active buttons node contact bypass triggered", "text", messageText)
-						contactCard := getContactCardText()
-						if err := a.sendAndSaveTextMessage(account, contact, contactCard); err != nil {
-							a.Log.Error("Failed to send contact bypass message", "error", err)
-						}
-						a.logSessionMessage(session.ID, models.DirectionOutgoing, contactCard, "contact_bypass")
-
-						// Re-send the current buttons node menu so they are not stuck
-						bodyText := stringFromConfig(node.Config, "body", "message", "text")
-						if bodyText == "" {
-							bodyText = node.Label
-						}
-						bodyText = processTemplate(bodyText, session.SessionData)
-						btnList := buttonsFromConfig(node.Config)
-						for _, b := range btnList {
-							for _, key := range []string{"title", "url", "phone_number"} {
-								if s, ok := b[key].(string); ok && s != "" {
-									b[key] = processTemplate(s, session.SessionData)
-								}
-							}
-						}
-						if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
-							a.Log.Error("Failed to re-send buttons menu after contact bypass", "error", err)
-						}
-						return
-					}
-
-					// 3. Fallback to AI / RAG if available
-					if a.canAttemptAI(settings, account.Name) {
-						a.Log.Info("Active buttons node fallback to AI", "text", messageText)
-						aiResponse, err := a.generateAIResponse(settings, session, messageText)
-						if err == nil && aiResponse != "" {
-							if err := a.sendAndSaveTextMessage(account, contact, aiResponse); err != nil {
-								a.Log.Error("Failed to send fallback AI response", "error", err)
-							}
-							a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
-
-							// After answering, always bring the user back to the main menu
-							// so they can navigate (Registration Hub / Service Query / Ask Darvi AI / Contact Us)
-							if err := a.sendGreetingMenu(account, contact, settings); err != nil {
-								a.Log.Error("Failed to re-send main menu after AI fallback", "error", err)
+							if err := a.runChatGraph(account, contact, session, nextFlow, messageText, buttonID, flowResponseData); err != nil {
+								a.Log.Error("Chat graph runner failed at flow start", "error", err, "session", session.ID, "flow", nextFlow.ID)
 							}
 							return
+						}
+
+						// 2. Try to match non-transfer keyword rules
+						if keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
+							a.Log.Info("Active buttons node breakout to keyword rule", "response", keywordResponse.Body)
+							if len(keywordResponse.Buttons) > 0 {
+								if err := a.sendAndSaveInteractiveButtons(account, contact, keywordResponse.Body, keywordResponse.Buttons); err != nil {
+									a.Log.Error("Failed to send breakout keyword buttons", "error", err)
+								}
+							} else {
+								if err := a.sendAndSaveTextMessage(account, contact, keywordResponse.Body); err != nil {
+									a.Log.Error("Failed to send breakout keyword text", "error", err)
+								}
+							}
+							a.logSessionMessage(session.ID, models.DirectionOutgoing, keywordResponse.Body, "keyword_response")
+
+							// Re-send the current buttons node menu so they are not stuck
+							bodyText := stringFromConfig(node.Config, "body", "message", "text")
+							if bodyText == "" {
+								bodyText = node.Label
+							}
+							bodyText = processTemplate(bodyText, session.SessionData)
+							btnList := buttonsFromConfig(node.Config)
+							for _, b := range btnList {
+								for _, key := range []string{"title", "url", "phone_number"} {
+									if s, ok := b[key].(string); ok && s != "" {
+										b[key] = processTemplate(s, session.SessionData)
+									}
+								}
+							}
+							if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
+								a.Log.Error("Failed to re-send buttons menu after keyword breakout", "error", err)
+							}
+							return
+						}
+
+						// Intercept contact query to bypass AI
+						if isContactOrLocationQuery(messageText) {
+							a.Log.Info("Active buttons node contact bypass triggered", "text", messageText)
+							contactCard := getContactCardText()
+							if err := a.sendAndSaveTextMessage(account, contact, contactCard); err != nil {
+								a.Log.Error("Failed to send contact bypass message", "error", err)
+							}
+							a.logSessionMessage(session.ID, models.DirectionOutgoing, contactCard, "contact_bypass")
+
+							// Re-send the current buttons node menu so they are not stuck
+							bodyText := stringFromConfig(node.Config, "body", "message", "text")
+							if bodyText == "" {
+								bodyText = node.Label
+							}
+							bodyText = processTemplate(bodyText, session.SessionData)
+							btnList := buttonsFromConfig(node.Config)
+							for _, b := range btnList {
+								for _, key := range []string{"title", "url", "phone_number"} {
+									if s, ok := b[key].(string); ok && s != "" {
+										b[key] = processTemplate(s, session.SessionData)
+									}
+								}
+							}
+							if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, btnList); err != nil {
+								a.Log.Error("Failed to re-send buttons menu after contact bypass", "error", err)
+							}
+							return
+						}
+
+						// 3. Fallback to AI / RAG if available
+						if a.canAttemptAI(settings, account.Name) {
+							a.Log.Info("Active buttons node fallback to AI", "text", messageText)
+							aiResponse, err := a.generateAIResponse(settings, session, messageText)
+							if err == nil && aiResponse != "" {
+								if err := a.sendAndSaveTextMessage(account, contact, aiResponse); err != nil {
+									a.Log.Error("Failed to send fallback AI response", "error", err)
+								}
+								a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
+
+								// After answering, always bring the user back to the main menu
+								// so they can navigate (Registration Hub / Service Query / Ask Darvi AI / Contact Us)
+								if err := a.sendGreetingMenu(account, contact, settings); err != nil {
+									a.Log.Error("Failed to re-send main menu after AI fallback", "error", err)
+								}
+								return
+							}
 						}
 					}
 				}
 			}
-		}
 
-		if err := a.runChatGraph(account, contact, session, flow, messageText, buttonID, flowResponseData); err != nil {
-			a.Log.Error("Chat graph runner failed", "error", err, "session", session.ID, "flow", flow.ID)
+			if err := a.runChatGraph(account, contact, session, flow, messageText, buttonID, flowResponseData); err != nil {
+				a.Log.Error("Chat graph runner failed", "error", err, "session", session.ID, "flow", flow.ID)
+			}
+			return
 		}
-		return
 	}
 
 	// Try to match flow trigger keywords first (before greeting to avoid duplicate messages)
-	if flow := a.matchFlowTrigger(account.OrganizationID, messageText); flow != nil {
+	if flow := a.matchFlowTrigger(account.OrganizationID, account.Name, messageText); flow != nil {
 		if flow.Graph == nil {
 			a.Log.Error("Triggered chatbot flow has no v2 graph; ignoring", "flow", flow.ID)
 			return
@@ -758,38 +775,58 @@ func (a *App) matchKeywordRules(orgID uuid.UUID, accountName, messageText string
 				response := &KeywordResponse{
 					ResponseType: rule.ResponseType,
 				}
+				response.Body = keywordResponseBody(rule.ResponseContent)
 
-				// For transfer type, use body as the transfer message
+				// Transfer type: body is optional notification before queueing
 				if rule.ResponseType == models.ResponseTypeTransfer {
-					if body, ok := rule.ResponseContent["body"].(string); ok {
-						response.Body = body
-					}
 					return response, true
 				}
 
-				// Get response body
-				if body, ok := rule.ResponseContent["body"].(string); ok {
-					response.Body = body
-				}
-
-				// Get buttons if present
-				if buttons, ok := rule.ResponseContent["buttons"].([]any); ok && len(buttons) > 0 {
-					response.Buttons = make([]map[string]any, 0, len(buttons))
-					for _, btn := range buttons {
-						if btnMap, ok := btn.(map[string]any); ok {
-							response.Buttons = append(response.Buttons, btnMap)
+				// Unsupported types (template/media/script/flow) fall back to text body when present
+				switch rule.ResponseType {
+				case models.ResponseTypeText, models.ResponseTypeTemplate, models.ResponseTypeMedia,
+					models.ResponseTypeScript, models.ResponseTypeFlow, "":
+					// Get buttons if present (text / button menus)
+					if buttons, ok := rule.ResponseContent["buttons"].([]any); ok && len(buttons) > 0 {
+						response.Buttons = make([]map[string]any, 0, len(buttons))
+						for _, btn := range buttons {
+							if btnMap, ok := btn.(map[string]any); ok {
+								response.Buttons = append(response.Buttons, btnMap)
+							}
 						}
 					}
-				}
-
-				if response.Body != "" {
-					return response, true
+					if response.Body != "" || len(response.Buttons) > 0 {
+						if response.Body == "" {
+							response.Body = " " // interactive needs non-empty body
+						}
+						return response, true
+					}
+					a.Log.Warn("Keyword rule matched but has no usable body",
+						"rule_id", rule.ID, "response_type", rule.ResponseType)
+				default:
+					if response.Body != "" {
+						return response, true
+					}
 				}
 			}
 		}
 	}
 
 	return nil, false
+}
+
+// keywordResponseBody reads body from response_content, falling back to "text".
+func keywordResponseBody(content models.JSONB) string {
+	if content == nil {
+		return ""
+	}
+	if body, ok := content["body"].(string); ok && strings.TrimSpace(body) != "" {
+		return body
+	}
+	if text, ok := content["text"].(string); ok {
+		return text
+	}
+	return ""
 }
 
 // sendAndSaveTextMessage sends a text message and saves it to the database
@@ -988,9 +1025,10 @@ func (a *App) logSessionMessage(sessionID uuid.UUID, direction models.Direction,
 	}
 }
 
-// matchFlowTrigger checks if the message triggers any flow
-func (a *App) matchFlowTrigger(orgID uuid.UUID, messageText string) *models.ChatbotFlow {
-	// Use cached flows (includes steps)
+// matchFlowTrigger checks if the message triggers any flow for this WA account.
+// Flows with empty WhatsAppAccount apply to all accounts; otherwise names must match.
+func (a *App) matchFlowTrigger(orgID uuid.UUID, accountName, messageText string) *models.ChatbotFlow {
+	// Use cached flows (enabled only)
 	flows, err := a.getChatbotFlowsCached(orgID)
 	if err != nil {
 		a.Log.Error("Failed to fetch chatbot flows", "error", err)
@@ -998,6 +1036,9 @@ func (a *App) matchFlowTrigger(orgID uuid.UUID, messageText string) *models.Chat
 	}
 
 	for _, flow := range flows {
+		if flow.WhatsAppAccount != "" && flow.WhatsAppAccount != accountName {
+			continue
+		}
 		for _, keyword := range flow.TriggerKeywords {
 			if flowTriggerKeywordMatches(messageText, keyword) {
 				return &flow
@@ -1005,6 +1046,53 @@ func (a *App) matchFlowTrigger(orgID uuid.UUID, messageText string) *models.Chat
 		}
 	}
 	return nil
+}
+
+// messageMatchesAnyKeyword reports whether message matches any of keywords
+// using the same whole-word / phrase rules as flow triggers.
+func messageMatchesAnyKeyword(message string, keywords models.StringArray) bool {
+	for _, keyword := range keywords {
+		if flowTriggerKeywordMatches(message, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPhoneExcluded checks if phone is listed in chatbot excluded numbers.
+// Matching is digit-normalized so "+91 98765" matches "9198765".
+func isPhoneExcluded(phone string, excluded models.JSONBArray) bool {
+	if len(excluded) == 0 || phone == "" {
+		return false
+	}
+	digits := digitsOnly(phone)
+	if digits == "" {
+		return false
+	}
+	for _, v := range excluded {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		ex := digitsOnly(s)
+		if ex == "" {
+			continue
+		}
+		if digits == ex || strings.HasSuffix(digits, ex) || strings.HasSuffix(ex, digits) {
+			return true
+		}
+	}
+	return false
+}
+
+func digitsOnly(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // flowTriggerKeywordMatches decides if a flow trigger keyword applies to the
@@ -1032,15 +1120,21 @@ func flowTriggerKeywordMatches(message, keyword string) bool {
 	return re.MatchString(message)
 }
 
-// startFlow initiates a chatbot flow for a user
+// exitFlow completes the session and detaches it from any flow so the next
+// inbound message can start clean automation routing.
 func (a *App) exitFlow(session *models.ChatbotSession) {
 	now := time.Now()
 	a.DB.Model(session).Updates(map[string]any{
-		"current_step": "",
-		"step_retries": 0,
-		"status":       models.SessionStatusCompleted,
-		"completed_at": now,
+		"current_flow_id": nil,
+		"current_step":    "",
+		"step_retries":    0,
+		"status":          models.SessionStatusCompleted,
+		"completed_at":    now,
 	})
+	session.CurrentFlowID = nil
+	session.CurrentStep = ""
+	session.Status = models.SessionStatusCompleted
+	session.CompletedAt = &now
 
 	// Clear chatbot tracking so SLA doesn't fire after flow exit
 	a.ClearContactChatbotTracking(session.ContactID)

@@ -468,11 +468,13 @@ func (a *App) UpdateCatalogProduct(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update product", nil, "")
 	}
 
-	// Update locally
+	body := r.RequestCtx.PostBody()
+
+	// Update locally — empty string when field is present clears optional text fields
 	if req.Name != "" {
 		product.Name = req.Name
 	}
-	if req.Description != "" {
+	if jsonFieldPresent(body, "description") {
 		product.Description = req.Description
 	}
 	if req.Price > 0 {
@@ -481,13 +483,13 @@ func (a *App) UpdateCatalogProduct(r *fastglue.Request) error {
 	if req.Currency != "" {
 		product.Currency = req.Currency
 	}
-	if req.URL != "" {
+	if jsonFieldPresent(body, "url") {
 		product.URL = req.URL
 	}
-	if req.ImageURL != "" {
+	if jsonFieldPresent(body, "image_url") {
 		product.ImageURL = req.ImageURL
 	}
-	if req.RetailerID != "" {
+	if jsonFieldPresent(body, "retailer_id") {
 		product.RetailerID = req.RetailerID
 	}
 

@@ -455,6 +455,50 @@ func TestApp_UpdateKeywordRule(t *testing.T) {
 		assert.False(t, updated.IsEnabled)
 		assert.Len(t, updated.Keywords, 3)
 	})
+
+	t.Run("clear keywords with empty array", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		rule := createTestKeywordRule(t, app, org.ID, "Clear Me", []string{"price", "cost"})
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"keywords": []string{},
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", rule.ID.String())
+
+		err := app.UpdateKeywordRule(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var updated models.KeywordRule
+		require.NoError(t, app.DB.First(&updated, "id = ?", rule.ID).Error)
+		assert.Empty(t, updated.Keywords, "empty array must clear keywords in DB")
+	})
+
+	t.Run("normalize text field into body", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		user := testutil.CreateTestUser(t, app.DB, org.ID)
+		rule := createTestKeywordRule(t, app, org.ID, "Text Field", []string{"hours"})
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"response_content": map[string]any{
+				"text": "We are open 9-5",
+			},
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", rule.ID.String())
+
+		err := app.UpdateKeywordRule(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var updated models.KeywordRule
+		require.NoError(t, app.DB.First(&updated, "id = ?", rule.ID).Error)
+		assert.Equal(t, "We are open 9-5", updated.ResponseContent["body"])
+	})
 }
 
 // =============================================================================
@@ -792,6 +836,49 @@ func TestApp_DeleteChatbotFlow(t *testing.T) {
 		var count int64
 		app.DB.Model(&models.ChatbotFlow{}).Where("id = ?", flow.ID).Count(&count)
 		assert.Equal(t, int64(0), count)
+	})
+
+	t.Run("completes active sessions parked on flow", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		perms := getChatbotFlowPermissions(t, app)
+		role := testutil.CreateTestRole(t, app.DB, org.ID, "flow-admin", perms)
+		user := testutil.CreateTestUser(t, app.DB, org.ID,
+			testutil.WithEmail(testutil.UniqueEmail("delete-flow-sess")),
+			testutil.WithRoleID(&role.ID),
+		)
+		flow := createTestChatbotFlow(t, app, org.ID, "Session Flow")
+		contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+		session := models.ChatbotSession{
+			BaseModel:       models.BaseModel{ID: uuid.New()},
+			OrganizationID:  org.ID,
+			ContactID:       contact.ID,
+			WhatsAppAccount: "test-account",
+			PhoneNumber:     contact.PhoneNumber,
+			Status:          models.SessionStatusActive,
+			CurrentFlowID:   &flow.ID,
+			CurrentStep:     "node-1",
+			SessionData:     models.JSONB{},
+			StartedAt:       time.Now(),
+			LastActivityAt:  time.Now(),
+		}
+		require.NoError(t, app.DB.Create(&session).Error)
+
+		req := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", flow.ID.String())
+
+		err := app.DeleteChatbotFlow(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var updated models.ChatbotSession
+		require.NoError(t, app.DB.First(&updated, "id = ?", session.ID).Error)
+		assert.Equal(t, models.SessionStatusCompleted, updated.Status)
+		assert.Nil(t, updated.CurrentFlowID)
+		assert.Empty(t, updated.CurrentStep)
+		assert.NotNil(t, updated.CompletedAt)
 	})
 
 	t.Run("not found", func(t *testing.T) {
@@ -1886,6 +1973,61 @@ func TestApp_UpdateChatbotFlow_Additional(t *testing.T) {
 		var updated models.ChatbotFlow
 		require.NoError(t, app.DB.First(&updated, "id = ?", flow.ID).Error)
 		assert.Equal(t, models.StringArray{"newkw1", "newkw2", "newkw3"}, updated.TriggerKeywords)
+	})
+
+	t.Run("clear trigger keywords with empty array", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		perms := getChatbotFlowPermissions(t, app)
+		role := testutil.CreateTestRole(t, app.DB, org.ID, "flow-admin", perms)
+		user := testutil.CreateTestUser(t, app.DB, org.ID,
+			testutil.WithEmail(testutil.UniqueEmail("clear-flow-kw")),
+			testutil.WithRoleID(&role.ID),
+		)
+		flow := createTestChatbotFlow(t, app, org.ID, "Clear Keywords Flow")
+		require.NotEmpty(t, flow.TriggerKeywords)
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"trigger_keywords": []string{},
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", flow.ID.String())
+
+		err := app.UpdateChatbotFlow(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var updated models.ChatbotFlow
+		require.NoError(t, app.DB.First(&updated, "id = ?", flow.ID).Error)
+		assert.Empty(t, updated.TriggerKeywords, "empty array must clear trigger keywords in DB")
+	})
+
+	t.Run("omit trigger keywords does not clear existing", func(t *testing.T) {
+		app := newTestApp(t)
+		org := testutil.CreateTestOrganization(t, app.DB)
+		perms := getChatbotFlowPermissions(t, app)
+		role := testutil.CreateTestRole(t, app.DB, org.ID, "flow-admin", perms)
+		user := testutil.CreateTestUser(t, app.DB, org.ID,
+			testutil.WithEmail(testutil.UniqueEmail("omit-flow-kw")),
+			testutil.WithRoleID(&role.ID),
+		)
+		flow := createTestChatbotFlow(t, app, org.ID, "Omit Keywords Flow")
+		original := append(models.StringArray(nil), flow.TriggerKeywords...)
+
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"enabled": false,
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		testutil.SetPathParam(req, "id", flow.ID.String())
+
+		err := app.UpdateChatbotFlow(req)
+		require.NoError(t, err)
+		assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+		var updated models.ChatbotFlow
+		require.NoError(t, app.DB.First(&updated, "id = ?", flow.ID).Error)
+		assert.Equal(t, original, updated.TriggerKeywords)
+		assert.False(t, updated.IsEnabled)
 	})
 }
 

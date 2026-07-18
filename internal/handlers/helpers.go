@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -10,6 +11,42 @@ import (
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
 )
+
+// jsonFieldPresent reports whether key was present in the JSON body (even if
+// null or empty). Used so partial updates can distinguish "omit field" from
+// "explicitly clear / set empty".
+func jsonFieldPresent(body []byte, key string) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return false
+	}
+	_, ok := m[key]
+	return ok
+}
+
+// jsonBoolPtr returns a *bool for key if present and a valid JSON bool.
+// Missing/invalid → nil (do not update).
+func jsonBoolPtr(body []byte, key string) *bool {
+	if len(body) == 0 {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil
+	}
+	raw, ok := m[key]
+	if !ok {
+		return nil
+	}
+	var v bool
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil
+	}
+	return &v
+}
 
 // errEnvelopeSent is a sentinel returned by helpers after they have already
 // written an error envelope to the response. Callers should return nil to the framework.
