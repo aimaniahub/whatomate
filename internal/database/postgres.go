@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/chatbot/flow"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"golang.org/x/crypto/bcrypt"
@@ -92,6 +93,9 @@ func GetMigrationModels() []MigrationModel {
 		{"ChatbotSessionMessage", &models.ChatbotSessionMessage{}},
 		{"AIContext", &models.AIContext{}},
 		{"AgentTransfer", &models.AgentTransfer{}},
+		{"InboundIdempotency", &models.InboundIdempotency{}},
+		// Phase 15: flow version snapshots (additive; pin via session.flow_version)
+		{"ChatbotFlowVersion", &flow.Version{}},
 
 		// User tracking
 		{"UserAvailabilityLog", &models.UserAvailabilityLog{}},

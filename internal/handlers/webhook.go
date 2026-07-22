@@ -2,13 +2,19 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
+	chatbotconfig "github.com/shridarpatil/whatomate/internal/chatbot/config"
+	"github.com/shridarpatil/whatomate/internal/chatbot/idempotency"
+	"github.com/shridarpatil/whatomate/internal/chatbot/lock"
+	"github.com/shridarpatil/whatomate/internal/chatbot/turn"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/valyala/fasthttp"
@@ -331,10 +337,15 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 
 			// Process messages
 			for _, msg := range change.Value.Messages {
+				// Correlation id is assigned at webhook accept for this message.
+				turnIDs := turn.NewIDs()
 				a.Log.Info("Received message",
-					"from", msg.From,
-					"type", msg.Type,
-					"phone_number_id", phoneNumberID,
+					turnIDs.With(
+						"from", msg.From,
+						"type", msg.Type,
+						"phone_number_id", phoneNumberID,
+						"wamid", msg.ID,
+					)...,
 				)
 
 				// Handle call permission replies before regular message processing
@@ -344,7 +355,8 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					cpr := msg.Interactive.CallPermissionReply
 					expTS, err := cpr.ExpirationTimestamp.Int64()
 					if err != nil {
-						a.Log.Error("Failed to parse call permission expiration timestamp", "error", err, "from", msg.From)
+						a.Log.Error("Failed to parse call permission expiration timestamp",
+							turnIDs.With("error", err, "from", msg.From)...)
 						continue
 					}
 					go a.processCallPermissionReply(phoneNumberID, msg.From, &CallPermissionReplyData{
@@ -368,12 +380,12 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 				// If phone number is missing (username user), skip — BSUID-only messaging not yet supported
 				if msg.From == "" {
 					a.Log.Warn("Incoming message without phone number (username user), skipping",
-						"bsuid", msg.FromUserID, "message_id", msg.ID)
+						turnIDs.With("bsuid", msg.FromUserID, "message_id", msg.ID)...)
 					continue
 				}
 
-				// Process message asynchronously
-				go a.processIncomingMessage(phoneNumberID, msg, profileName)
+				// Process message asynchronously (preserve correlation across the turn)
+				go a.processIncomingMessage(phoneNumberID, msg, profileName, turnIDs)
 			}
 
 			// Process status updates
@@ -392,31 +404,130 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]string{"status": "ok"})
 }
 
-func (a *App) processIncomingMessage(phoneNumberID string, msg any, profileName string) {
+func (a *App) processIncomingMessage(phoneNumberID string, msg any, profileName string, turnIDs turn.IDs) {
+	if !turnIDs.Valid() {
+		turnIDs = turn.NewIDs()
+	}
+	ctx := context.Background()
+
 	// Convert msg interface to the message struct
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
-		a.Log.Error("Failed to marshal message", "error", err)
+		a.Log.Error("Failed to marshal message", turnIDs.With("error", err)...)
 		return
 	}
 
 	var textMsg IncomingTextMessage
 	if err := json.Unmarshal(msgBytes, &textMsg); err != nil {
-		a.Log.Error("Failed to unmarshal message", "error", err)
+		a.Log.Error("Failed to unmarshal message", turnIDs.With("error", err)...)
 		return
 	}
 
-	// Check for duplicate message - Meta sometimes sends the same message multiple times
-	if textMsg.ID != "" {
+	// Resolve account early for flag scope + lock key (legacy full path also loads it).
+	account, accErr := a.getWhatsAppAccountCached(phoneNumberID)
+	scope := chatbotconfig.Scope{}
+	if accErr == nil && account != nil {
+		scope = chatbotconfig.Scope{
+			OrganizationID:  account.OrganizationID,
+			WhatsAppAccount: account.Name,
+		}
+	}
+
+	// --- Phase 2: WAMID idempotency (flag chatbot.idempotency_v1) ---
+	idempotencyHeld := false
+	if textMsg.ID != "" && a.Chatbot != nil && a.Chatbot.IdempotencyEnabled(scope) {
+		outcome, err := a.Chatbot.Idempotency.Begin(ctx, textMsg.ID, turnIDs, idempotency.DefaultLease)
+		if err != nil {
+			a.Log.Error("Idempotency begin failed; falling back to message-table dedupe",
+				turnIDs.With("error", err, "wamid", textMsg.ID)...)
+		} else {
+			switch outcome {
+			case idempotency.OutcomeDuplicate:
+				a.Log.Debug("Idempotency: duplicate WAMID, skipping",
+					turnIDs.With("wamid", textMsg.ID)...)
+				return
+			case idempotency.OutcomeInProgress:
+				a.Log.Debug("Idempotency: WAMID already in progress, skipping",
+					turnIDs.With("wamid", textMsg.ID)...)
+				return
+			case idempotency.OutcomeAcquired:
+				idempotencyHeld = true
+				a.Log.Info("Idempotency: acquired processing lease",
+					turnIDs.With("wamid", textMsg.ID)...)
+			}
+		}
+	}
+
+	// Legacy message-table dedupe when idempotency flag is off (or begin failed).
+	if !idempotencyHeld && textMsg.ID != "" {
 		var existingMsg models.Message
 		if err := a.DB.Where("whats_app_message_id = ?", textMsg.ID).First(&existingMsg).Error; err == nil {
-			a.Log.Debug("Duplicate message detected, skipping", "message_id", textMsg.ID)
+			a.Log.Debug("Duplicate message detected, skipping",
+				turnIDs.With("message_id", textMsg.ID)...)
 			return
 		}
 	}
 
-	// Process the message with chatbot logic
-	a.processIncomingMessageFull(phoneNumberID, textMsg, profileName)
+	// --- Phase 2: per-session lock (flag chatbot.session_lock_v1) ---
+	// Keyed by org + account + sender phone so concurrent turns for one user serialize.
+	if accErr == nil && account != nil && textMsg.From != "" &&
+		a.Chatbot != nil && a.Chatbot.SessionLockEnabled(scope) {
+		lockKey := lock.SessionKey(account.OrganizationID.String(), account.Name, textMsg.From)
+		unlock, err := a.Chatbot.Lock.Acquire(ctx, lockKey, lock.DefaultTTL)
+		if err != nil {
+			if errors.Is(err, lock.ErrNotAcquired) {
+				a.Log.Warn("Session lock not acquired within wait budget; skipping turn to avoid races",
+					turnIDs.With("lock_key", lockKey, "wamid", textMsg.ID)...)
+				// Do not Complete idempotency — allow retry after lease expiry.
+				return
+			}
+			a.Log.Error("Session lock acquire failed; continuing without lock",
+				turnIDs.With("error", err, "lock_key", lockKey)...)
+		} else {
+			defer unlock()
+			a.Log.Debug("Session lock acquired", turnIDs.With("lock_key", lockKey)...)
+		}
+	}
+
+	// --- Phase 5: orchestrator shell (flag chatbot.orchestrator_v2) or legacy direct ---
+	useLegacyDirect := a.Chatbot == nil || a.Chatbot.UseLegacyPath(scope)
+	if !useLegacyDirect {
+		tc, err := buildTurnContext(phoneNumberID, profileName, textMsg, turnIDs)
+		if err != nil {
+			a.Log.Error("Failed to build turn context; falling back to legacy",
+				turnIDs.With("error", err)...)
+			a.processIncomingMessageFull(phoneNumberID, textMsg, profileName, turnIDs)
+		} else {
+			if accErr == nil && account != nil {
+				tc.OrganizationID = account.OrganizationID
+				tc.WhatsAppAccount = account.Name
+			}
+			if a.Chatbot.ShadowCompareEnabled(scope) {
+				a.Chatbot.Orchestrator.ShadowCompare = true
+			}
+			res, err := a.Chatbot.Orchestrator.HandleTurn(ctx, tc)
+			if err != nil {
+				a.Log.Error("Orchestrator HandleTurn failed",
+					turnIDs.With("error", err)...)
+			} else if res != nil {
+				a.Log.Debug("Orchestrator result",
+					turnIDs.With("handler", res.Handler, "path", res.Path, "steps", len(res.Timeline))...)
+			}
+		}
+	} else {
+		// Optional shadow log when staying on legacy direct (shadow_compare_v1).
+		if a.Chatbot != nil && a.Chatbot.ShadowCompareEnabled(scope) {
+			a.logShadowPlan(turnIDs)
+		}
+		a.processIncomingMessageFull(phoneNumberID, textMsg, profileName, turnIDs)
+	}
+
+	if idempotencyHeld && textMsg.ID != "" && a.Chatbot != nil && a.Chatbot.Idempotency != nil {
+		if err := a.Chatbot.Idempotency.Complete(ctx, textMsg.ID); err != nil {
+			a.Log.Error("Idempotency complete failed",
+				turnIDs.With("error", err, "wamid", textMsg.ID)...)
+		}
+	}
 }
 
 func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) {

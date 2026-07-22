@@ -103,10 +103,12 @@ const (
 type SessionStatus string
 
 const (
-	SessionStatusActive    SessionStatus = "active"
-	SessionStatusCompleted SessionStatus = "completed"
-	SessionStatusCancelled SessionStatus = "cancelled"
-	SessionStatusTimeout   SessionStatus = "timeout"
+	SessionStatusActive     SessionStatus = "active"
+	SessionStatusCompleted  SessionStatus = "completed"
+	SessionStatusCancelled  SessionStatus = "cancelled"
+	SessionStatusTimeout    SessionStatus = "timeout"    // legacy alias; prefer expired
+	SessionStatusExpired    SessionStatus = "expired"    // inactivity sweeper
+	SessionStatusSuperseded SessionStatus = "superseded" // closed as duplicate open session
 )
 
 // TransferStatus represents agent transfer states

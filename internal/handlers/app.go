@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
+	"github.com/shridarpatil/whatomate/internal/chatbot"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
@@ -42,6 +43,9 @@ type App struct {
 	TTS *tts.PiperTTS
 	// S3Client for serving call recording presigned URLs (nil when not configured)
 	S3Client *storage.S3Client
+	// Chatbot is the refactor composition root (flags Phase 1; engines later).
+	// Nil is treated as all flags off + legacy path.
+	Chatbot *chatbot.Engine
 	// wg tracks background goroutines for graceful shutdown
 	wg sync.WaitGroup
 }

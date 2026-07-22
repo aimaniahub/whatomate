@@ -42,6 +42,22 @@ secret = "your-super-secret-jwt-key-change-in-production"  # Must be 32+ chars i
 access_expiry_mins = 15
 refresh_expiry_days = 1
 
+# Chatbot engine refactor feature flags (all default false = 100% legacy processor).
+# See CHATBOT_IMPLEMENTATION_SPECIFICATION.md. Enable only when the corresponding phase is ready.
+# Env overrides: WHATOMATE_CHATBOT_ORCHESTRATOR_V2=true etc.
+[chatbot]
+idempotency_v1 = false
+session_lock_v1 = false
+orchestrator_v2 = false
+wait_contract_v1 = false
+interactive_title_match_v1 = false
+priority_ladder_v1 = false
+ai_pipeline_v1 = false
+response_planner_v1 = false
+flow_versions_v1 = false
+shadow_compare_v1 = false
+
+
 [storage]
 type = "local"  # local, s3
 local_path = "./uploads"

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/assignment"
+	chattransfer "github.com/shridarpatil/whatomate/internal/chatbot/transfer"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -1254,7 +1256,27 @@ func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *mo
 		return
 	}
 
+	a.alignChatbotSessionOnTransfer(account.OrganizationID, contact.ID, account.Name)
 	a.Log.Info("Transfer created to agent queue", "transfer_id", transfer.ID, "contact_id", contact.ID, "source", source)
+}
+
+// alignChatbotSessionOnTransfer completes the active bot session (Phase 14).
+func (a *App) alignChatbotSessionOnTransfer(orgID, contactID uuid.UUID, accountName string) {
+	if a.Chatbot == nil || a.Chatbot.Sessions == nil {
+		return
+	}
+	// Load active session for this key without extending timeout window incorrectly.
+	var sess models.ChatbotSession
+	err := a.DB.Where(
+		"organization_id = ? AND contact_id = ? AND whats_app_account = ? AND status = ?",
+		orgID, contactID, accountName, models.SessionStatusActive,
+	).Order("last_activity_at DESC").First(&sess).Error
+	if err != nil {
+		return
+	}
+	if err := chattransfer.AlignSessionOnTransfer(context.Background(), a.Chatbot.Sessions, &sess); err != nil {
+		a.Log.Warn("Failed to align chatbot session on transfer", "error", err, "session", sess.ID)
+	}
 }
 
 // createTransferFromKeyword creates an agent transfer triggered by a keyword rule
@@ -1303,6 +1325,9 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 		return
 	}
 
+	// Phase 14: complete any active chatbot session under this contact.
+	a.alignChatbotSessionOnTransfer(account.OrganizationID, contact.ID, account.Name)
+
 	var agentIDStr string
 	if agentID != nil {
 		agentIDStr = agentID.String()
@@ -1320,6 +1345,7 @@ func (a *App) createTransferToTeam(account *models.WhatsAppAccount, contact *mod
 		a.Log.Debug("Contact already has active transfer, skipping team transfer", "contact_id", contact.ID, "team_id", teamID)
 		return
 	}
+	// Note: align runs after successful save below.
 
 	settings, _ := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
 

@@ -745,27 +745,6 @@ func TestMatchFlowTrigger_Match(t *testing.T) {
 // evaluateExpression (package-level, not on App)
 // =============================================================================
 
-func TestIsContactOrLocationQuery(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected bool
-	}{
-		{"where is your office?", true},
-		{"contact us please", true},
-		{"what is the address?", true},
-		{"send me the maps link", true},
-		{"i live in Bengaluru", true},
-		{"how to grow sandalwood?", false},
-		{"is coconut plant available", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			assert.Equal(t, tc.expected, isContactOrLocationQuery(tc.input))
-		})
-	}
-}
-
 func TestCleanAIResponse(t *testing.T) {
 	tests := []struct {
 		name     string

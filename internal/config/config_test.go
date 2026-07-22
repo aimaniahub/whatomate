@@ -73,6 +73,27 @@ api_version = "v22.0"
 	assert.Equal(t, "v22.0", cfg.WhatsApp.APIVersion)
 }
 
+func TestLoad_ChatbotFlagsDefaultOff(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, ""))
+	require.NoError(t, err)
+	assert.False(t, cfg.Chatbot.OrchestratorV2)
+	assert.False(t, cfg.Chatbot.IdempotencyV1)
+	assert.False(t, cfg.Chatbot.SessionLockV1)
+	assert.False(t, cfg.Chatbot.AIPipelineV1)
+}
+
+func TestLoad_ChatbotFlagsFromFile(t *testing.T) {
+	cfg, err := config.Load(writeConfig(t, `
+[chatbot]
+orchestrator_v2 = true
+idempotency_v1 = true
+`))
+	require.NoError(t, err)
+	assert.True(t, cfg.Chatbot.OrchestratorV2)
+	assert.True(t, cfg.Chatbot.IdempotencyV1)
+	assert.False(t, cfg.Chatbot.SessionLockV1)
+}
+
 func TestLoad_ProductionEnvironmentForcesSecureCookie(t *testing.T) {
 	cfg, err := config.Load(writeConfig(t, `
 [app]

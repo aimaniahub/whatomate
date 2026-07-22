@@ -108,6 +108,7 @@ func runMigrations(db *gorm.DB) error {
 		&models.ChatbotSessionMessage{},
 		&models.AIContext{},
 		&models.AgentTransfer{},
+		&models.InboundIdempotency{},
 		// Bulk message models
 		&models.BulkMessageCampaign{},
 		&models.BulkMessageRecipient{},
@@ -155,6 +156,7 @@ func cleanupTables(db *gorm.DB) {
 		"chatbot_settings",
 		"ai_contexts",
 		"agent_transfers",
+		"inbound_idempotency",
 		// WhatsApp tables
 		"messages",
 		"tags",

@@ -24,6 +24,24 @@ type Config struct {
 	Cookie       CookieConfig       `koanf:"cookie"`
 	Calling      CallingConfig      `koanf:"calling"`
 	TTS          TTSConfig          `koanf:"tts"`
+	// Chatbot holds global feature flags for the chatbot engine refactor.
+	// All flags default to false (legacy processor path). See internal/chatbot/config.
+	Chatbot ChatbotConfig `koanf:"chatbot"`
+}
+
+// ChatbotConfig is the [chatbot] TOML / WHATOMATE_CHATBOT_* environment section.
+// Flag names match CHATBOT_IMPLEMENTATION_SPECIFICATION.md.
+type ChatbotConfig struct {
+	IdempotencyV1           bool `koanf:"idempotency_v1"`
+	SessionLockV1           bool `koanf:"session_lock_v1"`
+	OrchestratorV2          bool `koanf:"orchestrator_v2"`
+	WaitContractV1          bool `koanf:"wait_contract_v1"`
+	InteractiveTitleMatchV1 bool `koanf:"interactive_title_match_v1"`
+	PriorityLadderV1        bool `koanf:"priority_ladder_v1"`
+	AIPipelineV1            bool `koanf:"ai_pipeline_v1"`
+	ResponsePlannerV1       bool `koanf:"response_planner_v1"`
+	FlowVersionsV1          bool `koanf:"flow_versions_v1"`
+	ShadowCompareV1         bool `koanf:"shadow_compare_v1"`
 }
 
 type TTSConfig struct {

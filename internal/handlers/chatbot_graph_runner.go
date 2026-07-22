@@ -12,6 +12,9 @@ import (
 
 	"github.com/expr-lang/expr"
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/chatbot/prompt"
+	"github.com/shridarpatil/whatomate/internal/chatbot/session"
+	"github.com/shridarpatil/whatomate/internal/chatbot/variable"
 	"github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/models"
 )
@@ -90,21 +93,23 @@ func (a *App) runChatGraph(
 		flowResponseData: flowResponseData,
 	}
 
-	// Seed built-in template variables so {{phone_number}} / {{contact_name}}
-	// work in any outgoing message without needing an upstream api_call.
+	// Seed built-in template variables (Phase 12 variable engine).
 	if session.SessionData == nil {
 		session.SessionData = models.JSONB{}
 	}
-	session.SessionData["phone_number"] = session.PhoneNumber
+	contactName := ""
+	if contact != nil {
+		contactName = contact.ProfileName
+	}
+	ve := variable.NewEngine()
+	if a.Chatbot != nil && a.Chatbot.Variables != nil {
+		ve = a.Chatbot.Variables
+	}
+	session.SessionData = ve.SeedSystem(session.SessionData, session.PhoneNumber, contactName, account.Name)
 	if contact != nil {
 		if name, ok := session.SessionData["contact_name"].(string); !ok || name == "" {
 			session.SessionData["contact_name"] = contact.ProfileName
 		}
-		session.SessionData["whatsapp_name"] = contact.ProfileName
-		session.SessionData["whatsapp_phone"] = session.PhoneNumber
-	} else {
-		session.SessionData["whatsapp_name"] = ""
-		session.SessionData["whatsapp_phone"] = session.PhoneNumber
 	}
 
 	if session.CurrentStep == "" {
@@ -342,9 +347,14 @@ func (a *App) execChatMessage(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 // the selection and returns "button:<id>" so the runner can resolve the
 // next edge and advance.
 // Config: { "body": "...", "buttons": [{ "id": "...", "title": "..." }, ...] }
+// Phase 6: when wait_contract_v1 is on, sets WaitContract on yield and clears it on consume.
 func (a *App) execChatButtons(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, error) {
 	if !ctx.consumed && ctx.buttonID != "" {
 		ctx.consumed = true
+		// Clear wait contract after successful selection (Phase 6).
+		if a.Chatbot != nil && a.Chatbot.Interactive != nil {
+			a.Chatbot.Interactive.ClearWait(ctx.session)
+		}
 		return nodeOutcome{outcome: "button:" + ctx.buttonID}, nil
 	}
 
@@ -370,6 +380,15 @@ func (a *App) execChatButtons(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, er
 		return nodeOutcome{}, fmt.Errorf("send buttons: %w", err)
 	}
 	a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, body, node.ID)
+
+	// Phase 6: persist explicit wait contract when flag enabled.
+	if a.Chatbot != nil && a.Chatbot.Interactive != nil && a.Chatbot.Interactive.ContractsEnabled {
+		flowID := ""
+		if ctx.session.CurrentFlowID != nil {
+			flowID = ctx.session.CurrentFlowID.String()
+		}
+		a.Chatbot.Interactive.SetButtonsWait(ctx.session, node.ID, flowID, body, buttons)
+	}
 	return nodeOutcome{yield: true}, nil
 }
 
@@ -406,6 +425,19 @@ func (a *App) execChatPrompt(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, err
 			return nodeOutcome{}, fmt.Errorf("send prompt: %w", err)
 		}
 		a.logSessionMessage(ctx.session.ID, models.DirectionOutgoing, rendered, node.ID)
+		// Phase 11: prompt wait contract when interactive contracts enabled.
+		if a.Chatbot != nil && a.Chatbot.Interactive != nil && a.Chatbot.Interactive.ContractsEnabled {
+			flowID := ""
+			if ctx.session.CurrentFlowID != nil {
+				flowID = ctx.session.CurrentFlowID.String()
+			}
+			prompt.SetWait(ctx.session, prompt.Config{
+				NodeID: node.ID, FlowID: flowID, Body: rendered,
+				ValidationRegex: stringFromConfig(node.Config, "validation_regex"),
+				StoreAs:         stringFromConfig(node.Config, "store_as"),
+				MaxRetries:      intFromConfig(node.Config, "max_retries", 3),
+			}, 0)
+		}
 		return nodeOutcome{yield: true}, nil
 	}
 
@@ -424,13 +456,19 @@ func (a *App) execChatPrompt(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, err
 		}
 	}
 
-	// Valid → persist + advance.
+	// Valid → clear wait, persist + advance.
+	if a.Chatbot != nil && a.Chatbot.Interactive != nil {
+		a.Chatbot.Interactive.ClearWait(ctx.session)
+	}
 	if storeAs := stringFromConfig(node.Config, "store_as"); storeAs != "" {
 		if ctx.session.SessionData == nil {
 			ctx.session.SessionData = models.JSONB{}
 		}
-		ctx.session.SessionData[storeAs] = input
-
+		if a.Chatbot != nil && a.Chatbot.Variables != nil {
+			ctx.session.SessionData = a.Chatbot.Variables.Set(ctx.session.SessionData, "flow", storeAs, input)
+		} else {
+			ctx.session.SessionData[storeAs] = input
+		}
 		// Persist entered name to the contact's profile name in the database
 		// NOTE: Disabled to collect name only from WhatsApp profile metadata (consistent tables)
 		// if storeAs == "contact_name" && ctx.contact != nil {
@@ -1088,11 +1126,51 @@ func (a *App) execChatEnd(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, error)
 // persistChatSession writes the running session state back to the DB.
 // Variables, current node, and the __path__ trail all live in SessionData
 // + dedicated columns. Called after every yield and on the completion path.
+// Uses session.Manager when available (optimistic version, expires_at).
 func (a *App) persistChatSession(s *models.ChatbotSession) error {
+	timeoutMins := 0
+	if settings, err := a.getChatbotSettingsCached(s.OrganizationID, s.WhatsAppAccount); err == nil && settings != nil {
+		timeoutMins = settings.SessionTimeoutMins
+	}
+	if timeoutMins <= 0 {
+		timeoutMins = 30
+	}
+
+	if a.Chatbot != nil && a.Chatbot.Sessions != nil {
+		if s.Status == models.SessionStatusCompleted && s.CompletionReason == "" {
+			s.CompletionReason = session.ReasonUserComplete
+		}
+		if err := a.Chatbot.Sessions.Save(context.Background(), s, timeoutMins); err != nil {
+			if errors.Is(err, session.ErrVersionConflict) {
+				a.Log.Warn("persist chat session version conflict; forcing save", "session", s.ID)
+			} else {
+				a.Log.Error("persist chat session via manager", "session", s.ID, "error", err)
+			}
+			// Force path without version guard so the turn still lands.
+			s.LastActivityAt = time.Now()
+			if s.Status == models.SessionStatusCompleted && s.CompletedAt == nil {
+				now := time.Now()
+				s.CompletedAt = &now
+			}
+			s.Version++
+			if err2 := a.DB.Save(s).Error; err2 != nil {
+				a.Log.Error("persist chat session", "session", s.ID, "error", err2)
+				return err2
+			}
+			return nil
+		}
+		return nil
+	}
+
 	s.LastActivityAt = time.Now()
 	if s.Status == models.SessionStatusCompleted && s.CompletedAt == nil {
 		now := time.Now()
 		s.CompletedAt = &now
+	}
+	if s.Version < 1 {
+		s.Version = 1
+	} else {
+		s.Version++
 	}
 	if err := a.DB.Save(s).Error; err != nil {
 		a.Log.Error("persist chat session", "session", s.ID, "error", err)

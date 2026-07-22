@@ -208,6 +208,20 @@ func runServer(args []string) {
 		Queue:      jobQueue,
 		HTTPClient: httpClient,
 	}
+	// Wire chatbot engine after App exists so App can implement LegacyHandler.
+	app.Chatbot = handlers.NewChatbotEngine(cfg, db, rdb, app, lo)
+	if g := app.Chatbot.Flags.Global(); g.AnyEnabled() {
+		lo.Info("Chatbot feature flags enabled (global)",
+			"idempotency_v1", g.IdempotencyV1,
+			"session_lock_v1", g.SessionLockV1,
+			"orchestrator_v2", g.OrchestratorV2,
+			"wait_contract_v1", g.WaitContractV1,
+			"ai_pipeline_v1", g.AIPipelineV1,
+			"shadow_compare_v1", g.ShadowCompareV1,
+		)
+	} else {
+		lo.Info("Chatbot engine: legacy path (all refactor flags off)")
+	}
 
 	// Initialize S3 client for call recordings (optional)
 	var s3Client *storage.S3Client
@@ -282,6 +296,16 @@ func runServer(args []string) {
 	go slaProcessor.Start(slaCtx)
 	lo.Info("SLA processor started")
 
+	// Start chatbot session sweeper (expire stale + supersede duplicates)
+	var sessionSweepCancel context.CancelFunc
+	if app.Chatbot != nil && app.Chatbot.Sessions != nil {
+		sweepCtx, cancel := context.WithCancel(context.Background())
+		sessionSweepCancel = cancel
+		sweeper := handlers.NewSessionSweeper(app)
+		go sweeper.Run(sweepCtx)
+		lo.Info("Chatbot session sweeper started")
+	}
+
 	// Start embedded workers
 	var workers []*worker.Worker
 	var workerCancel context.CancelFunc
@@ -326,6 +350,12 @@ func runServer(args []string) {
 	slaCancel()
 	slaProcessor.Stop()
 	lo.Info("SLA processor stopped")
+
+	if sessionSweepCancel != nil {
+		lo.Info("Stopping chatbot session sweeper...")
+		sessionSweepCancel()
+		lo.Info("Chatbot session sweeper stopped")
+	}
 
 	// Stop workers first
 	if workerCancel != nil {

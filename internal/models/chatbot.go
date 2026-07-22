@@ -218,7 +218,7 @@ type ChatbotSession struct {
 	ContactID       uuid.UUID     `gorm:"type:uuid;index;not null" json:"contact_id"`
 	WhatsAppAccount string        `gorm:"size:100;index;not null" json:"whatsapp_account"` // References WhatsAppAccount.Name
 	PhoneNumber     string        `gorm:"size:50;not null" json:"phone_number"`
-	Status          SessionStatus `gorm:"size:20;default:'active'" json:"status"` // active, completed, cancelled, timeout
+	Status          SessionStatus `gorm:"size:20;default:'active'" json:"status"` // active, completed, cancelled, timeout, expired, superseded
 	CurrentFlowID   *uuid.UUID    `gorm:"type:uuid" json:"current_flow_id,omitempty"`
 	CurrentStep     string        `gorm:"size:100" json:"current_step"`
 	StepRetries     int           `gorm:"default:0" json:"step_retries"`
@@ -226,6 +226,21 @@ type ChatbotSession struct {
 	StartedAt       time.Time     `gorm:"autoCreateTime" json:"started_at"`
 	LastActivityAt  time.Time     `json:"last_activity_at"`
 	CompletedAt     *time.Time    `json:"completed_at,omitempty"`
+
+	// Phase 3 session manager fields (additive; dual-read with legacy rows).
+	// Version is an optimistic concurrency token incremented on every Save.
+	Version int `gorm:"not null;default:1" json:"version"`
+	// TurnSeq counts processed inbound turns on this session.
+	TurnSeq int64 `gorm:"not null;default:0" json:"turn_seq"`
+	// ExpiresAt is when an open session is no longer eligible for resume.
+	// Indexed for the expire sweeper. Nil means derive from last_activity + timeout (legacy).
+	ExpiresAt *time.Time `gorm:"index" json:"expires_at,omitempty"`
+	// CompletionReason records why the session left the open state (audit).
+	CompletionReason string `gorm:"size:100" json:"completion_reason,omitempty"`
+	// WaitContract holds interactive/prompt wait state (Phase 6); nullable JSONB.
+	WaitContract JSONB `gorm:"type:jsonb" json:"wait_contract,omitempty"`
+	// FlowVersion pins the published flow definition (Phase 15); 0 = unpinned/latest.
+	FlowVersion int `gorm:"not null;default:0" json:"flow_version"`
 
 	// Relations
 	Organization *Organization           `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
