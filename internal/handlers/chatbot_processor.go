@@ -495,7 +495,10 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 			session, isNewSession = a.getOrCreateSession(account.OrganizationID, contact.ID, account.Name, msg.From, settings.SessionTimeoutMins)
 		} else {
 			// Interactive wait handling (buttons free-text / title match / breakout).
-			// Phase 6: title match + WaitContract clear rules when flags enabled.
+			// While parked on a buttons node the flow owns the turn: resolve
+			// clicks and typed titles to options, allow intentional breakouts
+			// (other flow / keyword), but never free-text AI — that hijacks
+			// the graph and leaves users with RAG fallback text + no flow buttons.
 			ie := a.interactiveEngine(chatbotconfig.Scope{
 				OrganizationID: account.OrganizationID, WhatsAppAccount: account.Name,
 			})
@@ -505,7 +508,10 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 					node := graph.getNode(session.CurrentStep)
 					if node != nil && node.Type == ChatNodeButtons {
 						btnList := buttonsFromConfig(node.Config)
-						// Phase 6: resolve typed titles → buttonID before breakout.
+						// Resolve typed titles / ids → buttonID before breakout.
+						// Prefer interactive engine when flags are on; always fall
+						// back to live button config so title match works even
+						// when wait_contract / title_match flags are off.
 						if ie != nil && (ie.TitleMatch || ie.ContractsEnabled) {
 							if resolved, ok, src := ie.ResolveButtonInput(session, btnList, buttonID, messageText); ok && resolved != "" {
 								if buttonID == "" || resolved != buttonID {
@@ -515,8 +521,15 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 								buttonID = resolved
 							}
 						}
+						if buttonID == "" {
+							if m := interactive.ResolveAgainstButtons(btnList, "", messageText); m != nil {
+								a.Log.Info("Buttons free-text matched option title/id",
+									"resolved_id", m.OptionID, "source", m.Source, "text", messageText)
+								buttonID = m.OptionID
+							}
+						}
 
-						// Free text at buttons (no resolved option): breakout path.
+						// Free text at buttons (no resolved option): limited breakout only.
 						if buttonID == "" {
 							// 1. Different flow trigger
 							if nextFlow := a.matchFlowTrigger(account.OrganizationID, account.Name, messageText); nextFlow != nil && nextFlow.ID != flow.ID {
@@ -537,7 +550,7 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 								return
 							}
 
-							// 2. Keyword breakout
+							// 2. Keyword breakout (not transfer — transfer already handled above)
 							if keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
 								a.Log.Info("Active buttons node breakout to keyword rule", "response", keywordResponse.Body)
 								if len(keywordResponse.Buttons) > 0 {
@@ -567,30 +580,26 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 								return
 							}
 
-							// 3. AI fallback — Phase 6: exit flow so greeting is a real reset (no stuck buttons).
-							if a.canAttemptAI(settings, account.Name) {
-								a.Log.Info("Active buttons node fallback to AI", "text", messageText)
-								aiResponse, err := a.generateAIResponse(settings, session, messageText)
-								if err == nil && aiResponse != "" {
-									if err := a.sendAndSaveTextMessage(account, contact, aiResponse); err != nil {
-										a.Log.Error("Failed to send fallback AI response", "error", err)
-									}
-									a.logSessionMessage(session.ID, models.DirectionOutgoing, aiResponse, "ai_response")
-
-									if ie != nil && ie.ContractsEnabled {
-										// Honest state: leave the flow wait so greeting owns free-chat.
-										ie.ClearWait(session)
-										a.exitFlow(session)
-										session, isNewSession = a.getOrCreateSession(
-											account.OrganizationID, contact.ID, account.Name, msg.From, settings.SessionTimeoutMins)
-										_ = isNewSession
-									}
-									if err := a.sendGreetingMenu(account, contact, settings); err != nil {
-										a.Log.Error("Failed to re-send main menu after AI fallback", "error", err)
-									}
-									return
-								}
+							// 3. No free-text AI while waiting on flow buttons.
+							// Stay on the same node and re-send the menu so the
+							// graph (not org RAG) remains in control.
+							a.Log.Info("Active buttons node free-text ignored; re-sending menu (AI suppressed)",
+								"text", messageText, "node", node.ID, "session", session.ID)
+							bodyText, renderedBtns := a.renderButtonsNode(node, session)
+							if err := a.sendAndSaveInteractiveButtons(account, contact, bodyText, renderedBtns); err != nil {
+								a.Log.Error("Failed to re-send buttons menu after free-text", "error", err)
+							} else {
+								a.logSessionMessage(session.ID, models.DirectionOutgoing, bodyText, node.ID)
 							}
+							if ie != nil && ie.ContractsEnabled {
+								flowID := ""
+								if session.CurrentFlowID != nil {
+									flowID = session.CurrentFlowID.String()
+								}
+								ie.SetButtonsWait(session, node.ID, flowID, bodyText, renderedBtns)
+								a.persistChatSession(session)
+							}
+							return
 						}
 					}
 				}

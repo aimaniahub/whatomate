@@ -120,6 +120,10 @@ func runMigrations(db *gorm.DB) error {
 		&models.CannedResponse{},
 		// Dashboard
 		&models.Widget{},
+		// Daily chat reports
+		&models.DailyReportSettings{},
+		&models.DailyReportRecipient{},
+		&models.DailyReportRun{},
 		// Conversation Notes
 		&models.ConversationNote{},
 		// Calling / IVR
@@ -138,6 +142,10 @@ func cleanupTables(db *gorm.DB) {
 	tables := []string{
 		// Dashboard tables
 		"widgets",
+		// Daily reports
+		"daily_report_runs",
+		"daily_report_recipients",
+		"daily_report_settings",
 		// Catalog tables
 		"catalog_products",
 		"catalogs",

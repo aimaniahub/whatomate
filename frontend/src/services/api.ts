@@ -442,6 +442,63 @@ export const agentAnalyticsService = {
     api.get('/analytics/agents', { params })
 }
 
+// Daily chat reports (Analytics → Daily Reports)
+export interface DailyReportRecipient {
+  id?: string
+  name: string
+  phone_number: string
+  is_active: boolean
+  sort_order?: number
+}
+
+export interface DailyReportSettings {
+  id: string
+  organization_id: string
+  whatsapp_account: string
+  enabled: boolean
+  timezone: string
+  send_time: string
+  report_language: string
+  recipients: DailyReportRecipient[]
+  next_run_preview?: string
+  max_recipients: number
+}
+
+export interface DailyReportRun {
+  id: string
+  report_date: string
+  status: string
+  triggered_by: string
+  chat_count: number
+  message_count: number
+  pdf_filename?: string
+  ai_model?: string
+  error_message?: string
+  send_errors?: string
+  sent_count: number
+  started_at?: string
+  finished_at?: string
+  has_pdf: boolean
+}
+
+export const dailyReportsService = {
+  getSettings: () => api.get('/analytics/daily-reports/settings'),
+  updateSettings: (data: {
+    whatsapp_account?: string
+    enabled?: boolean
+    timezone?: string
+    send_time?: string
+    report_language?: string
+    recipients: DailyReportRecipient[]
+  }) => api.put('/analytics/daily-reports/settings', data),
+  listRuns: () => api.get('/analytics/daily-reports/runs'),
+  getRun: (id: string) => api.get(`/analytics/daily-reports/runs/${id}`),
+  runNow: (date?: string) =>
+    api.post('/analytics/daily-reports/run', date ? { date } : {}, { timeout: 180000 }),
+  resend: (id: string) => api.post(`/analytics/daily-reports/runs/${id}/resend`),
+  downloadUrl: (id: string) => `/api/analytics/daily-reports/runs/${id}/download`
+}
+
 // Meta WhatsApp Analytics Types
 export type MetaAnalyticsType =
   | 'analytics'

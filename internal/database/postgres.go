@@ -110,6 +110,11 @@ func GetMigrationModels() []MigrationModel {
 		// Dashboard
 		{"Widget", &models.Widget{}},
 
+		// Daily chat reports (Analytics → Daily Reports)
+		{"DailyReportSettings", &models.DailyReportSettings{}},
+		{"DailyReportRecipient", &models.DailyReportRecipient{}},
+		{"DailyReportRun", &models.DailyReportRun{}},
+
 		// Conversation Notes
 		{"ConversationNote", &models.ConversationNote{}},
 

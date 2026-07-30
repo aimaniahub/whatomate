@@ -296,6 +296,12 @@ func runServer(args []string) {
 	go slaProcessor.Start(slaCtx)
 	lo.Info("SLA processor started")
 
+	// Start daily chat report scheduler (runs every minute; fires per-org at send_time)
+	dailyReportScheduler := handlers.NewDailyReportScheduler(app, time.Minute)
+	dailyReportCtx, dailyReportCancel := context.WithCancel(context.Background())
+	go dailyReportScheduler.Start(dailyReportCtx)
+	lo.Info("Daily report scheduler started")
+
 	// Start chatbot session sweeper (expire stale + supersede duplicates)
 	var sessionSweepCancel context.CancelFunc
 	if app.Chatbot != nil && app.Chatbot.Sessions != nil {
@@ -350,6 +356,11 @@ func runServer(args []string) {
 	slaCancel()
 	slaProcessor.Stop()
 	lo.Info("SLA processor stopped")
+
+	lo.Info("Stopping daily report scheduler...")
+	dailyReportCancel()
+	dailyReportScheduler.Stop()
+	lo.Info("Daily report scheduler stopped")
 
 	if sessionSweepCancel != nil {
 		lo.Info("Stopping chatbot session sweeper...")
@@ -798,6 +809,15 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/analytics/meta", app.GetMetaAnalytics)
 	g.GET("/api/analytics/meta/accounts", app.ListMetaAccountsForAnalytics)
 	g.POST("/api/analytics/meta/refresh", app.RefreshMetaAnalyticsCache)
+
+	// Daily chat reports (Analytics → Daily Reports)
+	g.GET("/api/analytics/daily-reports/settings", app.GetDailyReportSettings)
+	g.PUT("/api/analytics/daily-reports/settings", app.UpdateDailyReportSettings)
+	g.GET("/api/analytics/daily-reports/runs", app.ListDailyReportRuns)
+	g.GET("/api/analytics/daily-reports/runs/{id}", app.GetDailyReportRun)
+	g.GET("/api/analytics/daily-reports/runs/{id}/download", app.DownloadDailyReportPDF)
+	g.POST("/api/analytics/daily-reports/run", app.RunDailyReportNow)
+	g.POST("/api/analytics/daily-reports/runs/{id}/resend", app.ResendDailyReport)
 
 	// Widgets (customizable analytics)
 	g.GET("/api/widgets", app.ListWidgets)
