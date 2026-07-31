@@ -185,6 +185,7 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		return nil, 0, err
 	}
 
+	// GORM maps WhatsAppAccount → column whats_app_account (not whatsapp_account).
 	type row struct {
 		ContactID   uuid.UUID
 		ProfileName string
@@ -194,7 +195,7 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		CreatedAt   time.Time
 	}
 
-	q := a.DB.Table("messages").
+	q := a.DB.Model(&models.Message{}).
 		Select("messages.contact_id, contacts.profile_name, contacts.phone_number, messages.direction, messages.content, messages.created_at").
 		Joins("JOIN contacts ON contacts.id = messages.contact_id AND contacts.deleted_at IS NULL").
 		Where("messages.organization_id = ? AND messages.deleted_at IS NULL", orgID).
@@ -202,7 +203,7 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		Order("messages.contact_id, messages.created_at asc")
 
 	if strings.TrimSpace(waAccount) != "" {
-		q = q.Where("messages.whatsapp_account = ?", waAccount)
+		q = q.Where("messages.whats_app_account = ?", waAccount)
 	}
 
 	var rows []row
