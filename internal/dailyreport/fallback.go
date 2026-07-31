@@ -3,16 +3,21 @@ package dailyreport
 import (
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
-// FallbackSummarize builds a structured report without calling an LLM.
+// FallbackSummarize builds a structured report without calling an LLM (bullets from inbound text).
 func FallbackSummarize(reportDate string, orgName string, chats []ContactChat) ReportData {
+	genAt := time.Now().Format("2006-01-02 15:04")
 	if len(chats) == 0 {
 		return ReportData{
-			ReportDate: reportDate,
-			OrgName:    orgName,
-			EmptyDay:   true,
+			ReportDate:  reportDate,
+			GeneratedAt: genAt,
+			OrgName:     orgName,
+			EmptyDay:    true,
+			AIUsed:      false,
+			AIModel:     "none",
 			Overview: DayOverview{
 				TotalChats: 0,
 				Notes:      "No customer chats were recorded for this day.",
@@ -22,54 +27,126 @@ func FallbackSummarize(reportDate string, orgName string, chats []ContactChat) R
 	}
 
 	out := make([]ChatSummary, 0, len(chats))
-	callback := 0
-	intentCounts := map[string]int{}
-
-	for _, c := range chats {
+	for i, c := range chats {
+		serial := c.Serial
+		if serial <= 0 {
+			serial = i + 1
+		}
 		inbound := collectInboundTexts(c.Messages)
-		summary := "Customer messaged with no clear text content."
-		if len(inbound) > 0 {
-			joined := strings.Join(inbound, " | ")
-			summary = "Customer discussed: " + truncateRunes(joined, 280)
+		bullets := make([]string, 0, 3)
+		for _, t := range inbound {
+			if len(bullets) >= 3 {
+				break
+			}
+			bullets = append(bullets, truncateRunes(t, 120))
 		}
-		intent := guessIntent(inbound)
-		intentCounts[intent]++
-		callReq := looksLikeCallRequest(inbound)
-		if callReq {
-			callback++
+		if len(bullets) == 0 {
+			bullets = []string{"Customer messaged with no clear text content."}
 		}
-		prio := "normal"
-		if callReq {
-			prio = "high"
-		}
-		next := "Review chat and follow up if needed"
-		if callReq {
-			next = "Call the customer back"
+		date := c.ChatDate
+		if date == "" {
+			date = reportDate
 		}
 		out = append(out, ChatSummary{
-			Name:          nonEmpty(c.Name, c.Phone),
-			Phone:         c.Phone,
-			Summary:       summary,
-			Intent:        intent,
-			CallRequested: callReq,
-			Priority:      prio,
-			NextAction:    next,
+			Serial:  serial,
+			Date:    date,
+			Name:    nonEmpty(c.Name, c.Phone),
+			Phone:   c.Phone,
+			Bullets: bullets,
+			Summary: strings.Join(bullets, " • "),
 		})
 	}
 
-	top := topKeys(intentCounts, 5)
 	return ReportData{
-		ReportDate: reportDate,
-		OrgName:    orgName,
-		EmptyDay:   false,
+		ReportDate:  reportDate,
+		GeneratedAt: genAt,
+		OrgName:     orgName,
+		EmptyDay:    false,
+		AIUsed:      false,
+		AIModel:     "fallback",
 		Overview: DayOverview{
-			TotalChats:    len(out),
-			TopIntents:    top,
-			NeedsCallback: callback,
-			Notes:         fmt.Sprintf("Summarized %d chats (rule-based; AI not used).", len(out)),
+			TotalChats: len(out),
+			Notes:      fmt.Sprintf("Summarized %d chats (rule-based; AI not used).", len(out)),
 		},
 		Chats: out,
 	}
+}
+
+// MergeAISummaries maps AI bullets by serial id onto source chats (name/phone/date from DB).
+func MergeAISummaries(reportDate, orgName, generatedAt, aiModel string, chats []ContactChat, items []AISummaryItem) ReportData {
+	byID := map[int][]string{}
+	for _, it := range items {
+		byID[it.ID] = normalizeBullets(it.Bullets, 3)
+	}
+
+	out := make([]ChatSummary, 0, len(chats))
+	for i, c := range chats {
+		serial := c.Serial
+		if serial <= 0 {
+			serial = i + 1
+		}
+		bullets := byID[serial]
+		if len(bullets) == 0 {
+			// AI missed this id — short fallback from transcript
+			inbound := collectInboundTexts(c.Messages)
+			for _, t := range inbound {
+				if len(bullets) >= 3 {
+					break
+				}
+				bullets = append(bullets, truncateRunes(t, 120))
+			}
+			if len(bullets) == 0 {
+				bullets = []string{"No clear customer query extracted."}
+			}
+		}
+		date := c.ChatDate
+		if date == "" {
+			date = reportDate
+		}
+		out = append(out, ChatSummary{
+			Serial:  serial,
+			Date:    date,
+			Name:    nonEmpty(c.Name, c.Phone),
+			Phone:   c.Phone,
+			Bullets: bullets,
+			Summary: strings.Join(bullets, " • "),
+		})
+	}
+
+	if generatedAt == "" {
+		generatedAt = time.Now().Format("2006-01-02 15:04")
+	}
+	return ReportData{
+		ReportDate:  reportDate,
+		GeneratedAt: generatedAt,
+		OrgName:     orgName,
+		EmptyDay:    false,
+		AIUsed:      true,
+		AIModel:     aiModel,
+		Overview: DayOverview{
+			TotalChats: len(out),
+			Notes:      fmt.Sprintf("AI summarized %d chats (%s).", len(out), aiModel),
+		},
+		Chats: out,
+	}
+}
+
+func normalizeBullets(in []string, max int) []string {
+	out := make([]string, 0, max)
+	for _, b := range in {
+		b = strings.TrimSpace(b)
+		if b == "" {
+			continue
+		}
+		// strip leading bullet markers
+		b = strings.TrimLeft(b, "•-* \t")
+		b = truncateRunes(b, 160)
+		out = append(out, b)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
 }
 
 func collectInboundTexts(msgs []ChatMessage) []string {
@@ -83,64 +160,6 @@ func collectInboundTexts(msgs []ChatMessage) []string {
 			continue
 		}
 		out = append(out, t)
-	}
-	return out
-}
-
-func looksLikeCallRequest(inbound []string) bool {
-	blob := strings.ToLower(strings.Join(inbound, " "))
-	keys := []string{"call me", "call us", "please call", "callback", "call back", "phone me", "ring me", "talk to someone", "speak to"}
-	for _, k := range keys {
-		if strings.Contains(blob, k) {
-			return true
-		}
-	}
-	return false
-}
-
-func guessIntent(inbound []string) string {
-	blob := strings.ToLower(strings.Join(inbound, " "))
-	switch {
-	case strings.Contains(blob, "price") || strings.Contains(blob, "cost") || strings.Contains(blob, "rate"):
-		return "pricing"
-	case strings.Contains(blob, "register") || strings.Contains(blob, "registration"):
-		return "registration"
-	case strings.Contains(blob, "iot") || strings.Contains(blob, "sensor"):
-		return "iot"
-	case strings.Contains(blob, "sandalwood"):
-		return "sandalwood"
-	case strings.Contains(blob, "deliver"):
-		return "delivery"
-	case looksLikeCallRequest(inbound):
-		return "callback"
-	default:
-		return "general"
-	}
-}
-
-func topKeys(m map[string]int, n int) []string {
-	type kv struct {
-		k string
-		v int
-	}
-	var list []kv
-	for k, v := range m {
-		list = append(list, kv{k, v})
-	}
-	// simple selection sort by count desc
-	for i := 0; i < len(list); i++ {
-		for j := i + 1; j < len(list); j++ {
-			if list[j].v > list[i].v {
-				list[i], list[j] = list[j], list[i]
-			}
-		}
-	}
-	if n > len(list) {
-		n = len(list)
-	}
-	out := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		out = append(out, list[i].k)
 	}
 	return out
 }

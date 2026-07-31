@@ -24,6 +24,7 @@ import {
   TableRow
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import {
@@ -152,11 +153,30 @@ async function runNow() {
   if (!canWrite.value) return
   running.value = true
   try {
-    await dailyReportsService.runNow(runDate.value || undefined)
-    toast.success('Report generated', 'PDF created and send attempted to recipients')
+    // Wait for full AI → PDF → send pipeline before notifying the user.
+    const res = await dailyReportsService.runNow(runDate.value || undefined)
+    const run = (res.data?.data ?? res.data) as DailyReportRun
+    const ai = run?.ai_model ? `AI: ${run.ai_model}` : 'AI completed'
+    const chats = typeof run?.chat_count === 'number' ? `${run.chat_count} chats` : 'done'
+    toast.success(
+      'Report created',
+      `${chats} · ${ai} · sent ${run?.sent_count ?? 0}. Download from history.`
+    )
+    if (run?.send_errors) {
+      toast.warning('Send issues', run.send_errors)
+    }
+    if (run?.error_message) {
+      toast.warning('Run note', run.error_message)
+    }
     await load()
   } catch (e: any) {
-    toast.error('Run failed', e?.response?.data?.message || e?.message || 'Could not run report')
+    const msg =
+      e?.response?.data?.message ||
+      e?.response?.data?.data?.message ||
+      e?.message ||
+      'Could not run report'
+    toast.error('Run failed', msg)
+    await load()
   } finally {
     running.value = false
   }
@@ -211,12 +231,14 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="flex flex-col gap-6 p-6">
+  <div class="flex flex-col h-full min-h-0">
     <PageHeader
       :title="t('nav.dailyReports')"
       description="AI end-of-day chat summaries as PDF, sent to admin/employee WhatsApp numbers"
     />
 
+    <ScrollArea class="flex-1 min-h-0">
+      <div class="flex flex-col gap-6 p-6 pb-16">
     <ErrorState v-if="error" :description="error" @retry="load" />
 
     <template v-else>
@@ -227,8 +249,9 @@ onMounted(load)
             <CardTitle>Setup</CardTitle>
             <CardDescription>
               Max {{ maxRecipients }} recipients (admin + employee). Timezone defaults to Asia/Kolkata.
+              Scheduled jobs start AI <strong>10 minutes before</strong> send time so the PDF is ready.
               <span v-if="settings?.next_run_preview" class="block mt-1 text-xs">
-                Next schedule window: {{ settings.next_run_preview }}
+                {{ settings.next_run_preview }}
               </span>
             </CardDescription>
           </div>
@@ -346,8 +369,8 @@ onMounted(load)
         <CardHeader>
           <CardTitle>Run now</CardTitle>
           <CardDescription>
-            Generate PDF for a day (all contacts with messages) and send to recipients. Leave date
-            empty for today.
+            Runs AI first (chat → max 3 bullet points per contact by serial id), then builds the A4 PDF
+            and sends it. Toast shows only after the full report is ready. Leave date empty for today.
           </CardDescription>
         </CardHeader>
         <CardContent class="flex flex-wrap items-end gap-3">
@@ -357,7 +380,7 @@ onMounted(load)
           </div>
           <Button v-if="canWrite" :disabled="running" @click="runNow">
             <Play class="mr-2 h-4 w-4" />
-            {{ running ? 'Running…' : 'Run now' }}
+            {{ running ? 'AI analyzing & building PDF…' : 'Run now' }}
           </Button>
           <Button variant="outline" :disabled="loading" @click="load">
             <RefreshCw class="mr-2 h-4 w-4" />
@@ -389,6 +412,7 @@ onMounted(load)
                 <TableHead>Date</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Chats</TableHead>
+                <TableHead>AI</TableHead>
                 <TableHead>Trigger</TableHead>
                 <TableHead>Sent</TableHead>
                 <TableHead>Finished</TableHead>
@@ -409,6 +433,9 @@ onMounted(load)
                   </p>
                 </TableCell>
                 <TableCell>{{ run.chat_count }} ({{ run.message_count }} msgs)</TableCell>
+                <TableCell class="max-w-[140px] truncate text-xs" :title="run.ai_model || ''">
+                  {{ run.ai_model || '—' }}
+                </TableCell>
                 <TableCell>{{ run.triggered_by }}</TableCell>
                 <TableCell>{{ run.sent_count }}</TableCell>
                 <TableCell class="text-xs text-muted-foreground">
@@ -438,5 +465,7 @@ onMounted(load)
         </CardContent>
       </Card>
     </template>
+      </div>
+    </ScrollArea>
   </div>
 </template>

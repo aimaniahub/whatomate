@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -368,7 +369,13 @@ func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.
 	}
 	loc := dailyreport.LoadLocation(tz)
 	today := dailyreport.TodayDate(loc)
-	preview := today + " " + sendTime + " " + tz
+	// Scheduler starts AI 10 minutes before send_time so PDF is ready.
+	prepareAt, err := dailyreport.PrepareAt(time.Now(), loc, sendTime, dailyreport.ScheduleLeadMinutes)
+	preview := today + " send " + sendTime + " " + tz
+	if err == nil {
+		preview = fmt.Sprintf("%s · AI starts %s (send %s %s)",
+			today, prepareAt.Format("15:04"), sendTime, tz)
+	}
 
 	return DailyReportSettingsResponse{
 		ID:              s.ID.String(),

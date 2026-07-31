@@ -9,6 +9,9 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 )
 
+// ScheduleLeadMinutes is how early the scheduler starts AI+PDF so send time is ready.
+const ScheduleLeadMinutes = 10
+
 // LoadLocation resolves the org timezone (defaults to Asia/Kolkata).
 func LoadLocation(tz string) *time.Location {
 	tz = strings.TrimSpace(tz)
@@ -65,9 +68,31 @@ func ParseSendTime(sendTime string) (hour, minute int, err error) {
 	return h, m, nil
 }
 
-// ShouldRunSchedule reports whether local now is past send_time for reportDate day
-// and the job has not been completed yet (caller checks DB).
+// PrepareAt returns the local time when the job should start (send_time - lead).
+func PrepareAt(nowBase time.Time, loc *time.Location, sendTime string, leadMinutes int) (time.Time, error) {
+	if loc == nil {
+		loc = LoadLocation("")
+	}
+	if leadMinutes < 0 {
+		leadMinutes = ScheduleLeadMinutes
+	}
+	local := nowBase.In(loc)
+	h, m, err := ParseSendTime(sendTime)
+	if err != nil {
+		return time.Time{}, err
+	}
+	sendAt := time.Date(local.Year(), local.Month(), local.Day(), h, m, 0, 0, loc)
+	return sendAt.Add(-time.Duration(leadMinutes) * time.Minute), nil
+}
+
+// ShouldRunSchedule reports whether local now is past prepare time (send_time - lead)
+// for reportDate day. Caller still checks DB for already-completed runs.
 func ShouldRunSchedule(now time.Time, loc *time.Location, sendTime, reportDate string) bool {
+	return ShouldRunScheduleLead(now, loc, sendTime, reportDate, ScheduleLeadMinutes)
+}
+
+// ShouldRunScheduleLead is like ShouldRunSchedule with explicit lead minutes.
+func ShouldRunScheduleLead(now time.Time, loc *time.Location, sendTime, reportDate string, leadMinutes int) bool {
 	if loc == nil {
 		loc = LoadLocation("")
 	}
@@ -75,10 +100,9 @@ func ShouldRunSchedule(now time.Time, loc *time.Location, sendTime, reportDate s
 	if local.Format("2006-01-02") != reportDate {
 		return false
 	}
-	h, m, err := ParseSendTime(sendTime)
+	prepareAt, err := PrepareAt(now, loc, sendTime, leadMinutes)
 	if err != nil {
 		return false
 	}
-	sendAt := time.Date(local.Year(), local.Month(), local.Day(), h, m, 0, 0, loc)
-	return !local.Before(sendAt)
+	return !local.Before(prepareAt)
 }

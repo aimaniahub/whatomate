@@ -22,9 +22,11 @@ const (
 	maxChatsPerReport     = 200
 	maxMessagesPerContact = 40
 	maxMsgChars           = 500
+	aiBatchSize           = 12 // chats per AI call
 )
 
 // RunDailyReport generates the PDF for reportDate and sends it to active recipients.
+// It always runs AI first when there are chats (fails clearly if AI is not configured).
 // reportDate is YYYY-MM-DD in the settings timezone. Idempotent for schedule unless force.
 func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, force bool) (*models.DailyReportRun, error) {
 	settings, err := a.getOrCreateDailyReportSettings(orgID)
@@ -51,7 +53,6 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 			return &run, nil
 		}
 		if run.Status == models.DailyReportStatusRunning {
-			// Allow force after 30 minutes stuck
 			if !force && run.StartedAt != nil && time.Since(*run.StartedAt) < 30*time.Minute {
 				return &run, fmt.Errorf("report already running for %s", reportDate)
 			}
@@ -72,7 +73,6 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		}).Create(&run).Error; err != nil {
 			return nil, err
 		}
-		// re-load in case of race
 		if err := a.DB.Where("organization_id = ? AND report_date = ?", orgID, reportDate).First(&run).Error; err != nil {
 			return nil, err
 		}
@@ -91,8 +91,8 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		return nil, err
 	}
 
-	finished := time.Now()
 	fail := func(msg string) (*models.DailyReportRun, error) {
+		finished := time.Now()
 		run.Status = models.DailyReportStatusFailed
 		run.ErrorMessage = msg
 		run.FinishedAt = &finished
@@ -100,13 +100,13 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		return &run, fmt.Errorf("%s", msg)
 	}
 
-	// Org name
 	orgName := ""
 	var org models.Organization
 	if err := a.DB.Select("id", "name").Where("id = ?", orgID).First(&org).Error; err == nil {
 		orgName = org.Name
 	}
 
+	a.Log.Info("Daily report: collecting chats", "org", orgID, "date", reportDate)
 	chats, totalMsgs, err := a.collectDailyChats(orgID, settings.WhatsAppAccount, reportDate, loc)
 	if err != nil {
 		return fail("collect chats: " + err.Error())
@@ -114,11 +114,25 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	run.ChatCount = len(chats)
 	run.MessageCount = totalMsgs
 
-	reportData, aiModel, err := a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, chats)
-	if err != nil {
-		a.Log.Warn("Daily report AI summarize failed; using fallback", "org", orgID, "error", err)
+	genAt := time.Now().In(loc).Format("2006-01-02 15:04")
+	var reportData dailyreport.ReportData
+	var aiModel string
+
+	if len(chats) == 0 {
 		reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
-		aiModel = "fallback"
+		reportData.GeneratedAt = genAt
+		aiModel = "none"
+		a.Log.Info("Daily report: empty day (no AI)", "org", orgID, "date", reportDate)
+	} else {
+		a.Log.Info("Daily report: starting AI summarize",
+			"org", orgID, "date", reportDate, "chats", len(chats), "messages", totalMsgs)
+		reportData, aiModel, err = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
+		if err != nil {
+			a.Log.Error("Daily report AI failed", "org", orgID, "error", err)
+			return fail("AI summarize failed: " + err.Error() + ". Configure AI in Settings → Chatbot (provider, model, API key) and enable AI.")
+		}
+		a.Log.Info("Daily report: AI summarize complete",
+			"org", orgID, "model", aiModel, "rows", len(reportData.Chats), "ai_used", reportData.AIUsed)
 	}
 	run.AIModel = aiModel
 
@@ -135,7 +149,6 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	run.PDFPath = pdfPath
 	run.PDFFilename = filename
 
-	// Store summary
 	if b, err := json.Marshal(reportData); err == nil {
 		var m models.JSONB
 		if json.Unmarshal(b, &m) == nil {
@@ -143,24 +156,26 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		}
 	}
 
-	// Send to recipients
+	// Send after AI + PDF are fully ready
+	a.Log.Info("Daily report: sending PDF", "org", orgID, "recipients", len(settings.Recipients))
 	sent, sendErrs := a.sendDailyReportPDF(settings, &run, pdfBytes, filename, reportData)
 	run.SentCount = sent
 	if len(sendErrs) > 0 {
 		run.SendErrors = strings.Join(sendErrs, "; ")
 	}
 
-	finished = time.Now()
+	finished := time.Now()
 	run.FinishedAt = &finished
 	if reportData.EmptyDay || len(chats) == 0 {
 		run.Status = models.DailyReportStatusEmpty
 	} else {
 		run.Status = models.DailyReportStatusCompleted
 	}
-	// If PDF built but all sends failed and there were recipients, keep completed/empty but surface errors
 	if err := a.DB.Save(&run).Error; err != nil {
 		return &run, err
 	}
+	a.Log.Info("Daily report: complete",
+		"org", orgID, "status", run.Status, "sent", sent, "ai", aiModel)
 	return &run, nil
 }
 
@@ -214,6 +229,7 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 				ContactID: r.ContactID.String(),
 				Name:      name,
 				Phone:     r.PhoneNumber,
+				ChatDate:  reportDate,
 				Messages:  nil,
 			}
 			byContact[r.ContactID] = cc
@@ -229,117 +245,130 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		if text == "" {
 			text = "[non-text message]"
 		}
-		dir := string(r.Direction)
 		cc.Messages = append(cc.Messages, dailyreport.ChatMessage{
-			Direction: dir,
-			At:        r.CreatedAt.UTC().Format(time.RFC3339),
+			Direction: string(r.Direction),
+			At:        r.CreatedAt.In(loc).Format("15:04"),
 			Text:      text,
 		})
 		cc.MessageCount++
 	}
 
 	out := make([]dailyreport.ContactChat, 0, len(order))
-	for _, id := range order {
-		out = append(out, *byContact[id])
+	for i, id := range order {
+		cc := *byContact[id]
+		cc.Serial = i + 1
+		out = append(out, cc)
 	}
 	return out, total, nil
 }
 
-func (a *App) summarizeDailyChats(orgID uuid.UUID, waAccount, reportDate, orgName string, chats []dailyreport.ContactChat) (dailyreport.ReportData, string, error) {
+func (a *App) summarizeDailyChats(
+	orgID uuid.UUID,
+	waAccount, reportDate, orgName, generatedAt string,
+	chats []dailyreport.ContactChat,
+) (dailyreport.ReportData, string, error) {
 	if len(chats) == 0 {
-		return dailyreport.FallbackSummarize(reportDate, orgName, chats), "none", nil
+		r := dailyreport.FallbackSummarize(reportDate, orgName, chats)
+		r.GeneratedAt = generatedAt
+		return r, "none", nil
 	}
 
 	settings, err := a.getChatbotSettingsCached(orgID, waAccount)
-	if err != nil || !localAIReady(settings) {
-		return dailyreport.FallbackSummarize(reportDate, orgName, chats), "fallback", nil
-	}
-
-	// Build compact user payload
-	payload := map[string]any{
-		"report_date": reportDate,
-		"chats":       chats,
-	}
-	userJSON, err := json.Marshal(payload)
 	if err != nil {
-		return dailyreport.ReportData{}, "", err
+		// try org-level empty account
+		settings, err = a.getChatbotSettingsCached(orgID, "")
+	}
+	if err != nil || !localAIReady(settings) {
+		return dailyreport.ReportData{}, "", fmt.Errorf("AI is not configured for this organization (enable AI + provider + API key in Chatbot settings)")
 	}
 
-	systemPrompt := `You are an operations analyst. Given WhatsApp chats for one business day, return ONLY valid JSON (no markdown) with this shape:
-{
-  "report_date": "YYYY-MM-DD",
-  "overview": {
-    "total_chats": number,
-    "top_intents": ["..."],
-    "needs_callback": number,
-    "notes": "short day narrative"
-  },
-  "chats": [
-    {
-      "name": "string",
-      "phone": "string",
-      "summary": "1-3 sentence overall query summary",
-      "intent": "short label",
-      "call_requested": true/false,
-      "priority": "low|normal|high",
-      "next_action": "short"
-    }
-  ]
-}
-Rules: base every summary only on the transcript; do not invent facts; keep phone numbers unchanged; mark call_requested true if customer asked to be called or needs human callback.`
+	systemPrompt := `You summarize WhatsApp chat transcripts for an operations daily report.
+Return ONLY valid JSON (no markdown fences) with this exact shape:
+{"items":[{"id":1,"bullets":["point one","point two","point three"]}]}
 
-	// Temporarily override system prompt / history for this call
+Rules:
+- Each input chat has an integer "id". Echo the same id in your output.
+- For each id write at most 3 short bullet points (max 20 words each).
+- Capture the customer's overall query / intent only.
+- Base bullets ONLY on the messages provided. Do not invent facts.
+- Do not include names, phone numbers, or greetings.
+- Prefer inbound (customer) messages.`
+
 	aiSettings := *settings
 	aiSettings.AI.SystemPrompt = systemPrompt
 	aiSettings.AI.IncludeHistory = false
-	if aiSettings.AI.MaxTokens < 1500 {
-		aiSettings.AI.MaxTokens = 2500
+	if aiSettings.AI.MaxTokens < 2000 {
+		aiSettings.AI.MaxTokens = 3000
 	}
 
-	var answer string
-	switch aiSettings.AI.Provider {
-	case models.AIProviderOpenAI:
-		answer, err = a.generateOpenAIResponse(&aiSettings, nil, string(userJSON), "")
-	case models.AIProviderAnthropic:
-		answer, err = a.generateAnthropicResponse(&aiSettings, nil, string(userJSON), "")
-	case models.AIProviderGoogle:
-		answer, err = a.generateGoogleResponse(&aiSettings, nil, string(userJSON), "")
-	case models.AIProviderOpenRouter:
-		answer, err = a.generateOpenRouterResponse(&aiSettings, nil, string(userJSON), "")
-	default:
-		return dailyreport.FallbackSummarize(reportDate, orgName, chats), "fallback", nil
-	}
-	if err != nil {
-		return dailyreport.ReportData{}, "", err
-	}
+	allItems := make([]dailyreport.AISummaryItem, 0, len(chats))
+	modelLabel := string(aiSettings.AI.Provider) + ":" + aiSettings.AI.Model
 
-	answer = cleanAIResponse(answer)
-	answer = extractJSONObject(answer)
-
-	var parsed dailyreport.ReportData
-	if err := json.Unmarshal([]byte(answer), &parsed); err != nil {
-		return dailyreport.ReportData{}, "", fmt.Errorf("parse AI JSON: %w", err)
-	}
-	parsed.ReportDate = reportDate
-	parsed.OrgName = orgName
-	if parsed.Overview.TotalChats == 0 {
-		parsed.Overview.TotalChats = len(parsed.Chats)
-	}
-	// Ensure phones filled from source if AI dropped them
-	phoneByName := map[string]string{}
-	for _, c := range chats {
-		phoneByName[strings.ToLower(strings.TrimSpace(c.Name))] = c.Phone
-		phoneByName[c.Phone] = c.Phone
-	}
-	for i := range parsed.Chats {
-		if strings.TrimSpace(parsed.Chats[i].Phone) == "" {
-			if p, ok := phoneByName[strings.ToLower(strings.TrimSpace(parsed.Chats[i].Name))]; ok {
-				parsed.Chats[i].Phone = p
-			}
+	for start := 0; start < len(chats); start += aiBatchSize {
+		end := start + aiBatchSize
+		if end > len(chats) {
+			end = len(chats)
 		}
+		batch := chats[start:end]
+		payload := make([]dailyreport.AIChatPayload, 0, len(batch))
+		for _, c := range batch {
+			payload = append(payload, dailyreport.AIChatPayload{
+				ID:       c.Serial,
+				Messages: c.Messages,
+			})
+		}
+		userJSON, err := json.Marshal(map[string]any{
+			"report_date": reportDate,
+			"chats":       payload,
+		})
+		if err != nil {
+			return dailyreport.ReportData{}, "", err
+		}
+
+		a.Log.Info("Daily report AI batch",
+			"org", orgID, "from_id", batch[0].Serial, "to_id", batch[len(batch)-1].Serial, "count", len(batch))
+
+		answer, err := a.callDailyReportLLM(&aiSettings, string(userJSON))
+		if err != nil {
+			return dailyreport.ReportData{}, "", fmt.Errorf("batch %d-%d: %w", batch[0].Serial, batch[len(batch)-1].Serial, err)
+		}
+		answer = cleanAIResponse(answer)
+		answer = extractJSONObject(answer)
+
+		var parsed dailyreport.AISummaryResponse
+		if err := json.Unmarshal([]byte(answer), &parsed); err != nil {
+			return dailyreport.ReportData{}, "", fmt.Errorf("parse AI JSON (batch %d): %w; raw=%s", batch[0].Serial, err, truncateForLog(answer, 400))
+		}
+		allItems = append(allItems, parsed.Items...)
 	}
-	model := string(aiSettings.AI.Provider) + ":" + aiSettings.AI.Model
-	return parsed, model, nil
+
+	merged := dailyreport.MergeAISummaries(reportDate, orgName, generatedAt, modelLabel, chats, allItems)
+	return merged, modelLabel, nil
+}
+
+func (a *App) callDailyReportLLM(settings *models.ChatbotSettings, userMessage string) (string, error) {
+	var answer string
+	var err error
+	switch settings.AI.Provider {
+	case models.AIProviderOpenAI:
+		answer, err = a.generateOpenAIResponse(settings, nil, userMessage, "")
+	case models.AIProviderAnthropic:
+		answer, err = a.generateAnthropicResponse(settings, nil, userMessage, "")
+	case models.AIProviderGoogle:
+		answer, err = a.generateGoogleResponse(settings, nil, userMessage, "")
+	case models.AIProviderOpenRouter:
+		answer, err = a.generateOpenRouterResponse(settings, nil, userMessage, "")
+	default:
+		return "", fmt.Errorf("unsupported AI provider: %s", settings.AI.Provider)
+	}
+	return answer, err
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func extractJSONObject(s string) string {
@@ -374,7 +403,6 @@ func (a *App) sendDailyReportPDF(settings *models.DailyReportSettings, run *mode
 	}
 	accountName := strings.TrimSpace(settings.WhatsAppAccount)
 	if accountName == "" {
-		// pick first account for org
 		var acc models.WhatsAppAccount
 		if err := a.DB.Where("organization_id = ?", settings.OrganizationID).Order("created_at asc").First(&acc).Error; err != nil {
 			return 0, []string{"no whatsapp account configured"}
@@ -391,6 +419,9 @@ func (a *App) sendDailyReportPDF(settings *models.DailyReportSettings, run *mode
 		caption = fmt.Sprintf("Daily chat report — %s (no chats)", run.ReportDate)
 	} else {
 		caption = fmt.Sprintf("Daily chat report — %s (%d chats)", run.ReportDate, data.Overview.TotalChats)
+		if data.AIUsed {
+			caption += " · AI ready"
+		}
 	}
 
 	active := 0
@@ -413,7 +444,6 @@ func (a *App) sendDailyReportPDF(settings *models.DailyReportSettings, run *mode
 			errs = append(errs, fmt.Sprintf("%s: contact: %v", r.Name, err))
 			continue
 		}
-		// Ensure contact is associated with send account for routing
 		if contact.WhatsAppAccount == "" {
 			_ = a.DB.Model(contact).Update("whatsapp_account", account.Name).Error
 			contact.WhatsAppAccount = account.Name
@@ -462,7 +492,6 @@ func (a *App) getOrCreateDailyReportSettings(orgID uuid.UUID) (*models.DailyRepo
 		ReportLanguage: "en",
 	}
 	if err := a.DB.Create(&s).Error; err != nil {
-		// race
 		if err2 := a.DB.Where("organization_id = ?", orgID).First(&s).Error; err2 == nil {
 			return &s, nil
 		}
