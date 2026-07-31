@@ -25,7 +25,7 @@ const (
 	aiBatchSize           = 12 // chats per AI call
 )
 
-// RunDailyReport generates the PDF for reportDate and sends it to active recipients.
+// RunDailyReport generates the DOCX for reportDate and sends it to active recipients.
 // It always runs AI first when there are chats (fails clearly if AI is not configured).
 // reportDate is YYYY-MM-DD in the settings timezone. Idempotent for schedule unless force.
 func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, force bool) (*models.DailyReportRun, error) {
@@ -107,9 +107,9 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	}
 
 	a.Log.Info("Daily report: collecting chats", "org", orgID, "date", reportDate)
-	chats, totalMsgs, err := a.collectDailyChats(orgID, settings.WhatsAppAccount, reportDate, loc)
-	if err != nil {
-		return fail("collect chats: " + err.Error())
+	chats, totalMsgs, collectErr := a.collectDailyChats(orgID, settings.WhatsAppAccount, reportDate, loc)
+	if collectErr != nil {
+		return fail("collect chats: " + collectErr.Error())
 	}
 	run.ChatCount = len(chats)
 	run.MessageCount = totalMsgs
@@ -126,27 +126,28 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	} else {
 		a.Log.Info("Daily report: starting AI summarize",
 			"org", orgID, "date", reportDate, "chats", len(chats), "messages", totalMsgs)
-		reportData, aiModel, err = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
-		if err != nil {
-			a.Log.Error("Daily report AI failed", "org", orgID, "error", err)
-			return fail("AI summarize failed: " + err.Error() + ". Configure AI in Settings → Chatbot (provider, model, API key) and enable AI.")
+		var sumErr error
+		reportData, aiModel, sumErr = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
+		if sumErr != nil {
+			a.Log.Error("Daily report AI failed", "org", orgID, "error", sumErr)
+			return fail("AI summarize failed: " + sumErr.Error() + ". Configure AI on the Daily Reports page (provider, model, API key) and enable AI.")
 		}
 		a.Log.Info("Daily report: AI summarize complete",
 			"org", orgID, "model", aiModel, "rows", len(reportData.Chats), "ai_used", reportData.AIUsed)
 	}
 	run.AIModel = aiModel
 
-	pdfBytes, err := dailyreport.BuildPDF(reportData)
+	docBytes, err := dailyreport.BuildDOCX(reportData)
 	if err != nil {
-		return fail("pdf: " + err.Error())
+		return fail("docx: " + err.Error())
 	}
 
-	filename := fmt.Sprintf("daily-chat-report-%s.pdf", reportDate)
-	pdfPath, err := a.saveDailyReportPDF(orgID, reportDate, filename, pdfBytes)
+	filename := fmt.Sprintf("daily-chat-report-%s.docx", reportDate)
+	docPath, err := a.saveDailyReportFile(orgID, reportDate, filename, docBytes)
 	if err != nil {
-		return fail("save pdf: " + err.Error())
+		return fail("save docx: " + err.Error())
 	}
-	run.PDFPath = pdfPath
+	run.PDFPath = docPath // column stores report file path (docx)
 	run.PDFFilename = filename
 
 	if b, err := json.Marshal(reportData); err == nil {
@@ -156,9 +157,9 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		}
 	}
 
-	// Send after AI + PDF are fully ready
-	a.Log.Info("Daily report: sending PDF", "org", orgID, "recipients", len(settings.Recipients))
-	sent, sendErrs := a.sendDailyReportPDF(settings, &run, pdfBytes, filename, reportData)
+	// Send after AI + DOCX are fully ready
+	a.Log.Info("Daily report: sending DOCX", "org", orgID, "recipients", len(settings.Recipients))
+	sent, sendErrs := a.sendDailyReportFile(settings, &run, docBytes, filename, reportData)
 	run.SentCount = sent
 	if len(sendErrs) > 0 {
 		run.SendErrors = strings.Join(sendErrs, "; ")
@@ -175,7 +176,7 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		return &run, err
 	}
 	a.Log.Info("Daily report: complete",
-		"org", orgID, "status", run.Status, "sent", sent, "ai", aiModel)
+		"org", orgID, "status", run.Status, "sent", sent, "ai", aiModel, "file", filename)
 	return &run, nil
 }
 
@@ -414,7 +415,7 @@ func extractJSONObject(s string) string {
 	return s
 }
 
-func (a *App) saveDailyReportPDF(orgID uuid.UUID, reportDate, filename string, data []byte) (string, error) {
+func (a *App) saveDailyReportFile(orgID uuid.UUID, reportDate, filename string, data []byte) (string, error) {
 	base := "./uploads"
 	if a.Config != nil && a.Config.Storage.LocalPath != "" {
 		base = a.Config.Storage.LocalPath
@@ -430,7 +431,7 @@ func (a *App) saveDailyReportPDF(orgID uuid.UUID, reportDate, filename string, d
 	return path, nil
 }
 
-func (a *App) sendDailyReportPDF(settings *models.DailyReportSettings, run *models.DailyReportRun, pdf []byte, filename string, data dailyreport.ReportData) (sent int, errs []string) {
+func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *models.DailyReportRun, fileBytes []byte, filename string, data dailyreport.ReportData) (sent int, errs []string) {
 	if settings == nil {
 		return 0, []string{"no settings"}
 	}
@@ -457,6 +458,11 @@ func (a *App) sendDailyReportPDF(settings *models.DailyReportSettings, run *mode
 		}
 	}
 
+	mime := "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	if strings.HasSuffix(strings.ToLower(filename), ".pdf") {
+		mime = "application/pdf"
+	}
+
 	active := 0
 	for _, r := range settings.Recipients {
 		if !r.IsActive {
@@ -478,7 +484,7 @@ func (a *App) sendDailyReportPDF(settings *models.DailyReportSettings, run *mode
 			continue
 		}
 		if contact.WhatsAppAccount == "" {
-			_ = a.DB.Model(contact).Update("whatsapp_account", account.Name).Error
+			_ = a.DB.Model(contact).Update("whats_app_account", account.Name).Error
 			contact.WhatsAppAccount = account.Name
 		}
 
@@ -486,8 +492,8 @@ func (a *App) sendDailyReportPDF(settings *models.DailyReportSettings, run *mode
 			Account:       account,
 			Contact:       contact,
 			Type:          models.MessageTypeDocument,
-			MediaData:     pdf,
-			MediaMimeType: "application/pdf",
+			MediaData:     fileBytes,
+			MediaMimeType: mime,
 			MediaFilename: filename,
 			Caption:       caption,
 		}

@@ -294,7 +294,7 @@ func (a *App) GetDailyReportRun(r *fastglue.Request) error {
 	return r.SendEnvelope(toDailyRunDTO(run))
 }
 
-// DownloadDailyReportPDF streams the PDF for a run.
+// DownloadDailyReportPDF streams the report file (DOCX) for a run.
 func (a *App) DownloadDailyReportPDF(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
@@ -313,18 +313,22 @@ func (a *App) DownloadDailyReportPDF(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Run not found", nil, "")
 	}
 	if run.PDFPath == "" {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "PDF not available", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Report file not available", nil, "")
 	}
 	data, err := os.ReadFile(run.PDFPath)
 	if err != nil {
-		a.Log.Error("Failed to read daily report PDF", "path", run.PDFPath, "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "PDF file missing", nil, "")
+		a.Log.Error("Failed to read daily report file", "path", run.PDFPath, "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Report file missing", nil, "")
 	}
 	name := run.PDFFilename
 	if name == "" {
 		name = filepath.Base(run.PDFPath)
 	}
-	r.RequestCtx.Response.Header.Set("Content-Type", "application/pdf")
+	ct := "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	if strings.HasSuffix(strings.ToLower(name), ".pdf") {
+		ct = "application/pdf"
+	}
+	r.RequestCtx.Response.Header.Set("Content-Type", ct)
 	r.RequestCtx.Response.Header.Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	r.RequestCtx.SetBody(data)
 	r.RequestCtx.SetStatusCode(fasthttp.StatusOK)
@@ -365,13 +369,12 @@ func (a *App) RunDailyReportNow(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Run failed", nil, "")
 	}
 	if err != nil {
-		// Run may still have partial status; return DTO with error details
 		a.Log.Warn("Manual daily report finished with error", "error", err, "status", run.Status)
 	}
 	return r.SendEnvelope(toDailyRunDTO(*run))
 }
 
-// ResendDailyReport resends an existing run PDF to recipients.
+// ResendDailyReport resends an existing run report file to recipients.
 func (a *App) ResendDailyReport(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
@@ -390,11 +393,11 @@ func (a *App) ResendDailyReport(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Run not found", nil, "")
 	}
 	if run.PDFPath == "" {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "No PDF to resend", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "No report file to resend", nil, "")
 	}
-	pdf, err := os.ReadFile(run.PDFPath)
+	fileBytes, err := os.ReadFile(run.PDFPath)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "PDF file missing", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Report file missing", nil, "")
 	}
 	settings, err := a.getOrCreateDailyReportSettings(orgID)
 	if err != nil {
@@ -410,7 +413,7 @@ func (a *App) ResendDailyReport(r *fastglue.Request) error {
 	data.ReportDate = run.ReportDate
 	data.EmptyDay = run.Status == models.DailyReportStatusEmpty
 
-	sent, sendErrs := a.sendDailyReportPDF(settings, &run, pdf, run.PDFFilename, data)
+	sent, sendErrs := a.sendDailyReportFile(settings, &run, fileBytes, run.PDFFilename, data)
 	run.SentCount = sent
 	run.SendErrors = strings.Join(sendErrs, "; ")
 	_ = a.DB.Save(&run).Error

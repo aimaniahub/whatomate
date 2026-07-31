@@ -510,8 +510,14 @@ export const dailyReportsService = {
   }) => api.put('/analytics/daily-reports/settings', data),
   listRuns: () => api.get('/analytics/daily-reports/runs'),
   getRun: (id: string) => api.get(`/analytics/daily-reports/runs/${id}`),
-  runNow: (date?: string) =>
-    api.post('/analytics/daily-reports/run', date ? { date } : {}, { timeout: 180000 }),
+  runNow: (opts?: { date?: string }) =>
+    api.post(
+      '/analytics/daily-reports/run',
+      {
+        date: opts?.date || undefined
+      },
+      { timeout: 180000 }
+    ),
   resend: (id: string) => api.post(`/analytics/daily-reports/runs/${id}/resend`),
   downloadUrl: (id: string) => `/api/analytics/daily-reports/runs/${id}/download`
 }

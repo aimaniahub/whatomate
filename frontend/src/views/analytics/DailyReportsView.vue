@@ -187,13 +187,14 @@ async function runNow() {
   running.value = true
   try {
     // Wait for full AI → PDF → send pipeline before notifying the user.
-    const res = await dailyReportsService.runNow(runDate.value || undefined)
+    const res = await dailyReportsService.runNow({
+      date: runDate.value || undefined
+    })
     const run = (res.data?.data ?? res.data) as DailyReportRun
-    const ai = run?.ai_model ? `AI: ${run.ai_model}` : 'AI completed'
     const chats = typeof run?.chat_count === 'number' ? `${run.chat_count} chats` : 'done'
     toast.success(
       'Report created',
-      `${chats} · ${ai} · sent ${run?.sent_count ?? 0}. Download from history.`
+      `${chats} · sent ${run?.sent_count ?? 0}. Download DOCX from history.`
     )
     if (run?.send_errors) {
       toast.warning('Send issues', run.send_errors)
@@ -232,11 +233,13 @@ async function download(id: string) {
     const res = await api.get(`/analytics/daily-reports/runs/${id}/download`, {
       responseType: 'blob'
     })
-    const blob = new Blob([res.data], { type: 'application/pdf' })
+    const blob = new Blob([res.data], {
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `daily-report-${id}.pdf`
+    a.download = `daily-report-${id}.docx`
     a.click()
     URL.revokeObjectURL(url)
   } catch (e: any) {
@@ -513,8 +516,8 @@ onMounted(load)
         <CardHeader>
           <CardTitle>Run now</CardTitle>
           <CardDescription>
-            Uses the AI settings on this page (enable + API key required). AI summarizes chats first,
-            then PDF is built and sent. Toast shows only after the report is ready.
+            Uses AI settings on this page. Builds a Word (.docx) report from real chats for the selected day,
+            then sends it to recipients.
           </CardDescription>
         </CardHeader>
         <CardContent class="flex flex-wrap items-end gap-3">
@@ -524,7 +527,7 @@ onMounted(load)
           </div>
           <Button v-if="canWrite" :disabled="running" @click="runNow">
             <Play class="mr-2 h-4 w-4" />
-            {{ running ? 'AI analyzing & building PDF…' : 'Run now' }}
+            {{ running ? 'Building report…' : 'Run now' }}
           </Button>
           <Button variant="outline" :disabled="loading" @click="load">
             <RefreshCw class="mr-2 h-4 w-4" />
@@ -556,7 +559,6 @@ onMounted(load)
                 <TableHead>Date</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Chats</TableHead>
-                <TableHead>AI</TableHead>
                 <TableHead>Trigger</TableHead>
                 <TableHead>Sent</TableHead>
                 <TableHead>Finished</TableHead>
@@ -577,9 +579,6 @@ onMounted(load)
                   </p>
                 </TableCell>
                 <TableCell>{{ run.chat_count }} ({{ run.message_count }} msgs)</TableCell>
-                <TableCell class="max-w-[140px] truncate text-xs" :title="run.ai_model || ''">
-                  {{ run.ai_model || '—' }}
-                </TableCell>
                 <TableCell>{{ run.triggered_by }}</TableCell>
                 <TableCell>{{ run.sent_count }}</TableCell>
                 <TableCell class="text-xs text-muted-foreground">

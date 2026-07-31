@@ -1,7 +1,6 @@
 package dailyreport
 
 import (
-	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -20,7 +19,7 @@ func FallbackSummarize(reportDate string, orgName string, chats []ContactChat) R
 			AIModel:     "none",
 			Overview: DayOverview{
 				TotalChats: 0,
-				Notes:      "No customer chats were recorded for this day.",
+				Notes:      "",
 			},
 			Chats: []ChatSummary{},
 		}
@@ -66,7 +65,7 @@ func FallbackSummarize(reportDate string, orgName string, chats []ContactChat) R
 		AIModel:     "fallback",
 		Overview: DayOverview{
 			TotalChats: len(out),
-			Notes:      fmt.Sprintf("Summarized %d chats (rule-based; AI not used).", len(out)),
+			Notes:      "",
 		},
 		Chats: out,
 	}
@@ -125,7 +124,7 @@ func MergeAISummaries(reportDate, orgName, generatedAt, aiModel string, chats []
 		AIModel:     aiModel,
 		Overview: DayOverview{
 			TotalChats: len(out),
-			Notes:      fmt.Sprintf("AI summarized %d chats (%s).", len(out), aiModel),
+			Notes:      "",
 		},
 		Chats: out,
 	}

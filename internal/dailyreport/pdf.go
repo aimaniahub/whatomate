@@ -42,14 +42,7 @@ func BuildPDF(data ReportData) ([]byte, error) {
 	// Overview line
 	doc.setFont(9, false)
 	doc.y -= 4
-	overview := fmt.Sprintf("Total chats: %d", data.Overview.TotalChats)
-	if data.AIUsed && data.AIModel != "" {
-		overview += "  |  AI: " + data.AIModel
-	}
-	if data.Overview.Notes != "" {
-		overview += "  |  " + data.Overview.Notes
-	}
-	doc.wrapAt(marginL, overview, a4Width-marginL-marginR)
+	doc.wrapAt(marginL, fmt.Sprintf("Total chats: %d", data.Overview.TotalChats), a4Width-marginL-marginR)
 	doc.y -= 10
 
 	// Table header
