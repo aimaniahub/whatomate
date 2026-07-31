@@ -462,6 +462,16 @@ export interface DailyReportSettings {
   recipients: DailyReportRecipient[]
   next_run_preview?: string
   max_recipients: number
+  // Dedicated AI on this page
+  ai_enabled: boolean
+  ai_provider: string
+  ai_model: string
+  ai_max_tokens: number
+  ai_temperature: number
+  ai_system_prompt: string
+  ai_has_api_key: boolean
+  ai_default_prompt: string
+  ai_ready: boolean
 }
 
 export interface DailyReportRun {
@@ -490,6 +500,13 @@ export const dailyReportsService = {
     send_time?: string
     report_language?: string
     recipients: DailyReportRecipient[]
+    ai_enabled?: boolean
+    ai_provider?: string
+    ai_api_key?: string
+    ai_model?: string
+    ai_max_tokens?: number
+    ai_temperature?: number
+    ai_system_prompt?: string
   }) => api.put('/analytics/daily-reports/settings', data),
   listRuns: () => api.get('/analytics/daily-reports/runs'),
   getRun: (id: string) => api.get(`/analytics/daily-reports/runs/${id}`),

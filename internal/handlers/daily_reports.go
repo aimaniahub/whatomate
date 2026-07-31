@@ -27,6 +27,17 @@ type DailyReportSettingsResponse struct {
 	Recipients      []DailyReportRecipientDTO `json:"recipients"`
 	NextRunPreview  string                    `json:"next_run_preview,omitempty"`
 	MaxRecipients   int                       `json:"max_recipients"`
+
+	// Dedicated AI (this page) — API key never returned in full
+	AIEnabled         bool    `json:"ai_enabled"`
+	AIProvider        string  `json:"ai_provider"`
+	AIModel           string  `json:"ai_model"`
+	AIMaxTokens       int     `json:"ai_max_tokens"`
+	AITemperature     float64 `json:"ai_temperature"`
+	AISystemPrompt    string  `json:"ai_system_prompt"`
+	AIHasAPIKey       bool    `json:"ai_has_api_key"`
+	AIDefaultPrompt   string  `json:"ai_default_prompt"`
+	AIReady           bool    `json:"ai_ready"`
 }
 
 // DailyReportRecipientDTO is a setup recipient.
@@ -46,6 +57,14 @@ type UpdateDailyReportSettingsRequest struct {
 	SendTime        string                    `json:"send_time"`
 	ReportLanguage  string                    `json:"report_language"`
 	Recipients      []DailyReportRecipientDTO `json:"recipients"`
+
+	AIEnabled      *bool    `json:"ai_enabled"`
+	AIProvider     *string  `json:"ai_provider"`
+	AIAPIKey       *string  `json:"ai_api_key"` // omit or empty = keep existing; set to update
+	AIModel        *string  `json:"ai_model"`
+	AIMaxTokens    *int     `json:"ai_max_tokens"`
+	AITemperature  *float64 `json:"ai_temperature"`
+	AISystemPrompt *string  `json:"ai_system_prompt"`
 }
 
 // DailyReportRunDTO is a history row.
@@ -144,6 +163,56 @@ func (a *App) UpdateDailyReportSettings(r *fastglue.Request) error {
 	}
 	if req.Enabled != nil {
 		s.Enabled = *req.Enabled
+	}
+
+	// AI settings (dedicated to daily reports)
+	if req.AIEnabled != nil {
+		s.AIEnabled = *req.AIEnabled
+	}
+	if req.AIProvider != nil {
+		p := strings.ToLower(strings.TrimSpace(*req.AIProvider))
+		switch p {
+		case "", string(models.AIProviderOpenAI), string(models.AIProviderOpenRouter),
+			string(models.AIProviderAnthropic), string(models.AIProviderGoogle):
+			s.AIProvider = p
+		default:
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid AI provider (openai, openrouter, anthropic, google)", nil, "")
+		}
+	}
+	if req.AIAPIKey != nil {
+		key := strings.TrimSpace(*req.AIAPIKey)
+		// Empty string means "leave unchanged"; only update when non-empty.
+		// Use special value "-" to clear.
+		if key == "-" {
+			s.AIAPIKey = ""
+		} else if key != "" {
+			s.AIAPIKey = key
+		}
+	}
+	if req.AIModel != nil {
+		s.AIModel = strings.TrimSpace(*req.AIModel)
+	}
+	if req.AIMaxTokens != nil {
+		if *req.AIMaxTokens < 256 {
+			s.AIMaxTokens = 256
+		} else if *req.AIMaxTokens > 16000 {
+			s.AIMaxTokens = 16000
+		} else {
+			s.AIMaxTokens = *req.AIMaxTokens
+		}
+	}
+	if req.AITemperature != nil {
+		t := *req.AITemperature
+		if t < 0 {
+			t = 0
+		}
+		if t > 2 {
+			t = 2
+		}
+		s.AITemperature = t
+	}
+	if req.AISystemPrompt != nil {
+		s.AISystemPrompt = strings.TrimSpace(*req.AISystemPrompt)
 	}
 
 	tx := a.DB.Begin()
@@ -377,6 +446,19 @@ func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.
 			today, prepareAt.Format("15:04"), sendTime, tz)
 	}
 
+	prompt := s.AISystemPrompt
+	if strings.TrimSpace(prompt) == "" {
+		prompt = models.DefaultDailyReportAISystemPrompt
+	}
+	maxTok := s.AIMaxTokens
+	if maxTok <= 0 {
+		maxTok = 3000
+	}
+	temp := s.AITemperature
+	if temp <= 0 {
+		temp = 0.3
+	}
+
 	return DailyReportSettingsResponse{
 		ID:              s.ID.String(),
 		OrganizationID:  s.OrganizationID.String(),
@@ -388,6 +470,16 @@ func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.
 		Recipients:      dto,
 		NextRunPreview:  preview,
 		MaxRecipients:   models.MaxDailyReportRecipients,
+
+		AIEnabled:       s.AIEnabled,
+		AIProvider:      s.AIProvider,
+		AIModel:         s.AIModel,
+		AIMaxTokens:     maxTok,
+		AITemperature:   temp,
+		AISystemPrompt:  prompt,
+		AIHasAPIKey:     strings.TrimSpace(s.AIAPIKey) != "",
+		AIDefaultPrompt: models.DefaultDailyReportAISystemPrompt,
+		AIReady:         s.DailyReportAIReady(),
 	}
 }
 

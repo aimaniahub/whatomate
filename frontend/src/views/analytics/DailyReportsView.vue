@@ -57,8 +57,17 @@ const form = ref({
   timezone: 'Asia/Kolkata',
   send_time: '20:00',
   whatsapp_account: '',
-  recipients: [] as DailyReportRecipient[]
+  recipients: [] as DailyReportRecipient[],
+  ai_enabled: false,
+  ai_provider: 'openrouter',
+  ai_api_key: '',
+  ai_model: 'openai/gpt-4o-mini',
+  ai_max_tokens: 3000,
+  ai_temperature: 0.3,
+  ai_system_prompt: ''
 })
+
+const defaultAIPrompt = ref('')
 
 const maxRecipients = computed(() => settings.value?.max_recipients ?? 2)
 
@@ -73,6 +82,7 @@ async function load() {
     ])
     const s = (settingsRes.data?.data ?? settingsRes.data) as DailyReportSettings
     settings.value = s
+    defaultAIPrompt.value = s.ai_default_prompt || ''
     form.value = {
       enabled: !!s.enabled,
       timezone: s.timezone || 'Asia/Kolkata',
@@ -84,7 +94,14 @@ async function load() {
         phone_number: r.phone_number,
         is_active: r.is_active !== false,
         sort_order: r.sort_order
-      }))
+      })),
+      ai_enabled: !!s.ai_enabled,
+      ai_provider: s.ai_provider || 'openrouter',
+      ai_api_key: '', // never preload secret; leave blank to keep existing
+      ai_model: s.ai_model || 'openai/gpt-4o-mini',
+      ai_max_tokens: s.ai_max_tokens || 3000,
+      ai_temperature: s.ai_temperature ?? 0.3,
+      ai_system_prompt: s.ai_system_prompt || s.ai_default_prompt || ''
     }
     const runsData = runsRes.data?.data ?? runsRes.data
     runs.value = runsData?.runs || []
@@ -127,7 +144,7 @@ async function saveSettings() {
   }
   saving.value = true
   try {
-    const res = await dailyReportsService.updateSettings({
+    const payload: Parameters<typeof dailyReportsService.updateSettings>[0] = {
       enabled: form.value.enabled,
       timezone: form.value.timezone || 'Asia/Kolkata',
       send_time: form.value.send_time,
@@ -137,11 +154,27 @@ async function saveSettings() {
         phone_number: r.phone_number.trim(),
         is_active: r.is_active,
         sort_order: i
-      }))
-    })
+      })),
+      ai_enabled: form.value.ai_enabled,
+      ai_provider: form.value.ai_provider,
+      ai_model: form.value.ai_model,
+      ai_max_tokens: Number(form.value.ai_max_tokens) || 3000,
+      ai_temperature: Number(form.value.ai_temperature) || 0.3,
+      ai_system_prompt: form.value.ai_system_prompt
+    }
+    // Only send API key when user typed a new one
+    if (form.value.ai_api_key.trim()) {
+      payload.ai_api_key = form.value.ai_api_key.trim()
+    }
+    const res = await dailyReportsService.updateSettings(payload)
     const s = (res.data?.data ?? res.data) as DailyReportSettings
     settings.value = s
-    toast.success('Saved', 'Daily report setup updated')
+    form.value.ai_api_key = ''
+    form.value.ai_enabled = !!s.ai_enabled
+    form.value.ai_provider = s.ai_provider || form.value.ai_provider
+    form.value.ai_model = s.ai_model || form.value.ai_model
+    form.value.ai_system_prompt = s.ai_system_prompt || form.value.ai_system_prompt
+    toast.success('Saved', s.ai_ready ? 'Setup saved · AI ready' : 'Setup saved · enable AI + API key to generate summaries')
   } catch (e: any) {
     toast.error('Save failed', e?.response?.data?.message || e?.message || 'Could not save')
   } finally {
@@ -308,6 +341,117 @@ onMounted(load)
               </div>
             </div>
 
+            <!-- AI settings (same page) -->
+            <div class="space-y-4 rounded-lg border p-4">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 class="text-sm font-semibold">AI settings</h3>
+                  <p class="text-xs text-muted-foreground">
+                    Used only for daily report summaries. Configure here — no chatbot settings needed.
+                  </p>
+                </div>
+                <div class="flex items-center gap-2">
+                  <Badge v-if="settings?.ai_ready" variant="default">AI ready</Badge>
+                  <Badge v-else variant="secondary">AI not ready</Badge>
+                  <Switch id="dr-ai-enabled" v-model:checked="form.ai_enabled" :disabled="!canWrite" />
+                  <Label for="dr-ai-enabled">Enable AI</Label>
+                </div>
+              </div>
+
+              <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div class="space-y-2">
+                  <Label>Provider</Label>
+                  <Select
+                    :model-value="form.ai_provider"
+                    :disabled="!canWrite"
+                    @update:model-value="(v: string) => (form.ai_provider = v)"
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Provider" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="openrouter">OpenRouter</SelectItem>
+                      <SelectItem value="openai">OpenAI</SelectItem>
+                      <SelectItem value="anthropic">Anthropic</SelectItem>
+                      <SelectItem value="google">Google</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div class="space-y-2">
+                  <Label>Model</Label>
+                  <Input
+                    v-model="form.ai_model"
+                    :disabled="!canWrite"
+                    placeholder="openai/gpt-4o-mini"
+                  />
+                </div>
+                <div class="space-y-2">
+                  <Label>API key</Label>
+                  <Input
+                    v-model="form.ai_api_key"
+                    type="password"
+                    :disabled="!canWrite"
+                    :placeholder="
+                      settings?.ai_has_api_key
+                        ? '•••• saved (type new key to replace)'
+                        : 'Paste API key'
+                    "
+                    autocomplete="off"
+                  />
+                  <p v-if="settings?.ai_has_api_key" class="text-xs text-muted-foreground">
+                    Key is saved. Leave blank to keep current key.
+                  </p>
+                </div>
+                <div class="space-y-2">
+                  <Label>Max tokens</Label>
+                  <Input
+                    v-model.number="form.ai_max_tokens"
+                    type="number"
+                    min="256"
+                    max="16000"
+                    :disabled="!canWrite"
+                  />
+                </div>
+                <div class="space-y-2">
+                  <Label>Temperature</Label>
+                  <Input
+                    v-model.number="form.ai_temperature"
+                    type="number"
+                    min="0"
+                    max="2"
+                    step="0.1"
+                    :disabled="!canWrite"
+                  />
+                </div>
+              </div>
+
+              <div class="space-y-2">
+                <div class="flex items-center justify-between gap-2">
+                  <Label>System prompt</Label>
+                  <Button
+                    v-if="canWrite && defaultAIPrompt"
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    @click="form.ai_system_prompt = defaultAIPrompt"
+                  >
+                    Reset to default
+                  </Button>
+                </div>
+                <textarea
+                  v-model="form.ai_system_prompt"
+                  :disabled="!canWrite"
+                  rows="8"
+                  class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+                  placeholder="Prompt that structures bullet summaries as JSON by chat id…"
+                />
+                <p class="text-xs text-muted-foreground">
+                  Must ask for JSON with items[].id and items[].bullets (max 3). Name/phone are filled from
+                  the database after AI runs.
+                </p>
+              </div>
+            </div>
+
             <div class="space-y-3">
               <div class="flex items-center justify-between">
                 <Label>Recipients (max {{ maxRecipients }})</Label>
@@ -369,8 +513,8 @@ onMounted(load)
         <CardHeader>
           <CardTitle>Run now</CardTitle>
           <CardDescription>
-            Runs AI first (chat → max 3 bullet points per contact by serial id), then builds the A4 PDF
-            and sends it. Toast shows only after the full report is ready. Leave date empty for today.
+            Uses the AI settings on this page (enable + API key required). AI summarizes chats first,
+            then PDF is built and sent. Toast shows only after the report is ready.
           </CardDescription>
         </CardHeader>
         <CardContent class="flex flex-wrap items-end gap-3">

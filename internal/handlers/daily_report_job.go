@@ -273,36 +273,68 @@ func (a *App) summarizeDailyChats(
 		return r, "none", nil
 	}
 
-	settings, err := a.getChatbotSettingsCached(orgID, waAccount)
+	// Prefer dedicated Daily Reports AI settings (configured on the same page).
+	drSettings, err := a.getOrCreateDailyReportSettings(orgID)
 	if err != nil {
-		// try org-level empty account
-		settings, err = a.getChatbotSettingsCached(orgID, "")
-	}
-	if err != nil || !localAIReady(settings) {
-		return dailyreport.ReportData{}, "", fmt.Errorf("AI is not configured for this organization (enable AI + provider + API key in Chatbot settings)")
+		return dailyreport.ReportData{}, "", fmt.Errorf("load daily report settings: %w", err)
 	}
 
-	systemPrompt := `You summarize WhatsApp chat transcripts for an operations daily report.
-Return ONLY valid JSON (no markdown fences) with this exact shape:
-{"items":[{"id":1,"bullets":["point one","point two","point three"]}]}
+	var aiSettings models.ChatbotSettings
+	var modelLabel string
 
-Rules:
-- Each input chat has an integer "id". Echo the same id in your output.
-- For each id write at most 3 short bullet points (max 20 words each).
-- Capture the customer's overall query / intent only.
-- Base bullets ONLY on the messages provided. Do not invent facts.
-- Do not include names, phone numbers, or greetings.
-- Prefer inbound (customer) messages.`
+	if drSettings.DailyReportAIReady() {
+		prompt := strings.TrimSpace(drSettings.AISystemPrompt)
+		if prompt == "" {
+			prompt = models.DefaultDailyReportAISystemPrompt
+		}
+		maxTok := drSettings.AIMaxTokens
+		if maxTok < 2000 {
+			maxTok = 3000
+		}
+		temp := drSettings.AITemperature
+		if temp <= 0 {
+			temp = 0.3
+		}
+		aiSettings = models.ChatbotSettings{
+			OrganizationID: orgID,
+			AI: models.AIConfig{
+				Enabled:        true,
+				Provider:       models.AIProvider(drSettings.AIProvider),
+				APIKey:         drSettings.AIAPIKey,
+				Model:          drSettings.AIModel,
+				MaxTokens:      maxTok,
+				Temperature:    temp,
+				SystemPrompt:   prompt,
+				IncludeHistory: false,
+			},
+		}
+		modelLabel = drSettings.AIProvider + ":" + drSettings.AIModel
+		a.Log.Info("Daily report using page AI settings", "org", orgID, "model", modelLabel)
+	} else {
+		// Fallback to chatbot settings if page AI not configured
+		settings, err := a.getChatbotSettingsCached(orgID, waAccount)
+		if err != nil {
+			settings, err = a.getChatbotSettingsCached(orgID, "")
+		}
+		if err != nil || !localAIReady(settings) {
+			return dailyreport.ReportData{}, "", fmt.Errorf("AI is not configured on Daily Reports page — enable AI, set provider, model, and API key under Setup → AI settings")
+		}
+		aiSettings = *settings
+		aiSettings.AI.SystemPrompt = models.DefaultDailyReportAISystemPrompt
+		aiSettings.AI.IncludeHistory = false
+		if aiSettings.AI.MaxTokens < 2000 {
+			aiSettings.AI.MaxTokens = 3000
+		}
+		modelLabel = string(aiSettings.AI.Provider) + ":" + aiSettings.AI.Model
+		a.Log.Info("Daily report using chatbot AI settings (page AI not ready)", "org", orgID, "model", modelLabel)
+	}
 
-	aiSettings := *settings
-	aiSettings.AI.SystemPrompt = systemPrompt
-	aiSettings.AI.IncludeHistory = false
-	if aiSettings.AI.MaxTokens < 2000 {
-		aiSettings.AI.MaxTokens = 3000
+	// Always apply report prompt if still empty
+	if strings.TrimSpace(aiSettings.AI.SystemPrompt) == "" {
+		aiSettings.AI.SystemPrompt = models.DefaultDailyReportAISystemPrompt
 	}
 
 	allItems := make([]dailyreport.AISummaryItem, 0, len(chats))
-	modelLabel := string(aiSettings.AI.Provider) + ":" + aiSettings.AI.Model
 
 	for start := 0; start < len(chats); start += aiBatchSize {
 		end := start + aiBatchSize
@@ -490,6 +522,12 @@ func (a *App) getOrCreateDailyReportSettings(orgID uuid.UUID) (*models.DailyRepo
 		Timezone:       models.DefaultDailyReportTimezone,
 		SendTime:       models.DefaultDailyReportSendTime,
 		ReportLanguage: "en",
+		AIEnabled:      false,
+		AIProvider:     string(models.AIProviderOpenRouter),
+		AIModel:        "openai/gpt-4o-mini",
+		AIMaxTokens:    3000,
+		AITemperature:  0.3,
+		AISystemPrompt: models.DefaultDailyReportAISystemPrompt,
 	}
 	if err := a.DB.Create(&s).Error; err != nil {
 		if err2 := a.DB.Where("organization_id = ?", orgID).First(&s).Error; err2 == nil {

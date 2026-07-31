@@ -1,6 +1,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +31,19 @@ const DefaultDailyReportTimezone = "Asia/Kolkata"
 // DefaultDailyReportSendTime is local HH:MM when not configured.
 const DefaultDailyReportSendTime = "20:00"
 
+// DefaultDailyReportAISystemPrompt is the built-in summarizer prompt (editable per org).
+const DefaultDailyReportAISystemPrompt = `You summarize WhatsApp chat transcripts for an operations daily report.
+Return ONLY valid JSON (no markdown fences) with this exact shape:
+{"items":[{"id":1,"bullets":["point one","point two","point three"]}]}
+
+Rules:
+- Each input chat has an integer "id". Echo the same id in your output.
+- For each id write at most 3 short bullet points (max 20 words each).
+- Capture the customer's overall query / intent only.
+- Base bullets ONLY on the messages provided. Do not invent facts.
+- Do not include names, phone numbers, or greetings.
+- Prefer inbound (customer) messages.`
+
 // DailyReportSettings is per-organization configuration for end-of-day chat reports.
 type DailyReportSettings struct {
 	BaseModel
@@ -40,8 +54,26 @@ type DailyReportSettings struct {
 	SendTime        string    `gorm:"size:5;default:'20:00'" json:"send_time"` // HH:MM local
 	ReportLanguage  string    `gorm:"size:10;default:'en'" json:"report_language"`
 
-	Organization *Organization           `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
-	Recipients   []DailyReportRecipient  `gorm:"foreignKey:SettingsID" json:"recipients,omitempty"`
+	// Dedicated AI settings for daily reports (independent of chatbot settings UI).
+	AIEnabled      bool    `gorm:"default:false" json:"ai_enabled"`
+	AIProvider     string  `gorm:"size:30" json:"ai_provider"` // openai, openrouter, anthropic, google
+	AIAPIKey       string  `gorm:"column:ai_api_key;type:text" json:"-"`
+	AIModel        string  `gorm:"size:120" json:"ai_model"`
+	AIMaxTokens    int     `gorm:"default:3000" json:"ai_max_tokens"`
+	AITemperature  float64 `gorm:"type:decimal(3,2);default:0.3" json:"ai_temperature"`
+	AISystemPrompt string  `gorm:"type:text" json:"ai_system_prompt"`
+
+	Organization *Organization          `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
+	Recipients   []DailyReportRecipient `gorm:"foreignKey:SettingsID" json:"recipients,omitempty"`
+}
+
+// DailyReportAIReady reports whether dedicated report AI can be used.
+func (s *DailyReportSettings) DailyReportAIReady() bool {
+	if s == nil {
+		return false
+	}
+	return s.AIEnabled && strings.TrimSpace(s.AIProvider) != "" &&
+		strings.TrimSpace(s.AIAPIKey) != "" && strings.TrimSpace(s.AIModel) != ""
 }
 
 func (DailyReportSettings) TableName() string {
