@@ -169,12 +169,21 @@ async function saveSettings() {
     const res = await dailyReportsService.updateSettings(payload)
     const s = (res.data?.data ?? res.data) as DailyReportSettings
     settings.value = s
+    form.value.enabled = !!s.enabled
+    form.value.send_time = s.send_time || form.value.send_time
+    form.value.timezone = s.timezone || form.value.timezone
     form.value.ai_api_key = ''
     form.value.ai_enabled = !!s.ai_enabled
     form.value.ai_provider = s.ai_provider || form.value.ai_provider
     form.value.ai_model = s.ai_model || form.value.ai_model
     form.value.ai_system_prompt = s.ai_system_prompt || form.value.ai_system_prompt
-    toast.success('Saved', s.ai_ready ? 'Setup saved · AI ready' : 'Setup saved · enable AI + API key to generate summaries')
+    const scheduleMsg = s.schedule_active
+      ? `Schedule ON · ${s.schedule_cadence || 'daily'}`
+      : 'Schedule OFF'
+    toast.success(
+      'Saved',
+      `${scheduleMsg}. ${s.ai_ready ? 'AI ready.' : 'Enable AI + API key for summaries.'}`
+    )
   } catch (e: any) {
     toast.error('Save failed', e?.response?.data?.message || e?.message || 'Could not save')
   } finally {
@@ -278,6 +287,92 @@ onMounted(load)
     <ErrorState v-if="error" :description="error" @retry="load" />
 
     <template v-else>
+      <!-- Schedule status (visible after save / always from DB) -->
+      <Card>
+        <CardHeader class="pb-3">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <CardTitle class="text-base">Schedule</CardTitle>
+              <CardDescription>
+                Runs <strong>every day</strong> for that calendar day’s chats (timezone-aware).
+              </CardDescription>
+            </div>
+            <Badge :variant="settings?.schedule_active ? 'default' : 'secondary'">
+              {{ settings?.schedule_active ? 'Active' : 'Off' }}
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent class="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
+          <div>
+            <p class="text-xs text-muted-foreground">Cadence</p>
+            <p class="font-medium">{{ settings?.schedule_cadence || '—' }}</p>
+          </div>
+          <div>
+            <p class="text-xs text-muted-foreground">Next generate (AI starts)</p>
+            <p class="font-medium">
+              {{
+                settings?.next_fire_at
+                  ? new Date(settings.next_fire_at).toLocaleString()
+                  : settings?.schedule_active
+                    ? '—'
+                    : 'Enable schedule to activate'
+              }}
+            </p>
+          </div>
+          <div>
+            <p class="text-xs text-muted-foreground">Next send time</p>
+            <p class="font-medium">
+              {{
+                settings?.next_send_at
+                  ? new Date(settings.next_send_at).toLocaleString()
+                  : '—'
+              }}
+            </p>
+          </div>
+          <div>
+            <p class="text-xs text-muted-foreground">Today’s report ({{ settings?.today_report_date || '—' }})</p>
+            <p class="font-medium">
+              <Badge
+                v-if="settings?.today_run_status"
+                :variant="statusVariant(settings.today_run_status)"
+                class="mr-1"
+              >
+                {{ settings.today_run_status }}
+              </Badge>
+              <span v-if="settings?.today_run_triggered_by" class="text-muted-foreground">
+                via {{ settings.today_run_triggered_by }}
+              </span>
+              <span v-if="!settings?.today_run_status">Not run yet today</span>
+            </p>
+          </div>
+          <div>
+            <p class="text-xs text-muted-foreground">Last scheduled fire</p>
+            <p class="font-medium">
+              <template v-if="settings?.last_scheduled_date">
+                {{ settings.last_scheduled_date }}
+                <Badge
+                  v-if="settings.last_scheduled_status"
+                  :variant="statusVariant(settings.last_scheduled_status)"
+                  class="ml-1"
+                >
+                  {{ settings.last_scheduled_status }}
+                </Badge>
+              </template>
+              <span v-else>—</span>
+            </p>
+            <p v-if="settings?.last_scheduled_at" class="text-xs text-muted-foreground">
+              {{ new Date(settings.last_scheduled_at).toLocaleString() }}
+            </p>
+          </div>
+          <div>
+            <p class="text-xs text-muted-foreground">Lead time</p>
+            <p class="font-medium">
+              Starts {{ settings?.schedule_lead_minutes ?? 10 }} min before send time
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
       <!-- Setup -->
       <Card>
         <CardHeader class="flex flex-row items-start justify-between gap-4 space-y-0">
@@ -285,10 +380,7 @@ onMounted(load)
             <CardTitle>Setup</CardTitle>
             <CardDescription>
               Max {{ maxRecipients }} recipients (admin + employee). Timezone defaults to Asia/Kolkata.
-              Scheduled jobs start AI <strong>10 minutes before</strong> send time so the PDF is ready.
-              <span v-if="settings?.next_run_preview" class="block mt-1 text-xs">
-                {{ settings.next_run_preview }}
-              </span>
+              Turn on schedule and Save — it runs every day at the send time.
             </CardDescription>
           </div>
           <Button v-if="canWrite" :disabled="saving" @click="saveSettings">
@@ -305,8 +397,9 @@ onMounted(load)
             <div class="flex flex-wrap items-center gap-6">
               <div class="flex items-center gap-3">
                 <Switch id="dr-enabled" v-model:checked="form.enabled" :disabled="!canWrite" />
-                <Label for="dr-enabled">Enable scheduled send</Label>
+                <Label for="dr-enabled">Enable daily schedule</Label>
               </div>
+              <Badge v-if="form.enabled" variant="default">Will run every day</Badge>
             </div>
 
             <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

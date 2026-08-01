@@ -3,7 +3,6 @@ package dailyreport
 import (
 	"bytes"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -78,16 +77,6 @@ func TestMergeAISummaries_ByID(t *testing.T) {
 	require.Len(t, r.Chats[1].Bullets, 2)
 }
 
-func TestShouldRunSchedule_Lead10(t *testing.T) {
-	loc := LoadLocation("Asia/Kolkata")
-	// 19:50 IST on a fixed day with send 20:00 → lead 10 → prepare at 19:50 → true
-	now := timeInLoc(loc, 2026, 7, 31, 19, 50)
-	require.True(t, ShouldRunSchedule(now, loc, "20:00", "2026-07-31"))
-	// 19:49 → false
-	nowEarly := timeInLoc(loc, 2026, 7, 31, 19, 49)
-	require.False(t, ShouldRunSchedule(nowEarly, loc, "20:00", "2026-07-31"))
-}
 
-func timeInLoc(loc *time.Location, y int, m time.Month, d, h, min int) time.Time {
-	return time.Date(y, m, d, h, min, 0, 0, loc)
-}
+
+

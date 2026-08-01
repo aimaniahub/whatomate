@@ -49,9 +49,9 @@ type DailyReportSettings struct {
 	BaseModel
 	OrganizationID  uuid.UUID `gorm:"type:uuid;uniqueIndex;not null" json:"organization_id"`
 	WhatsAppAccount string    `gorm:"size:100" json:"whatsapp_account"` // Account used to send the PDF
-	Enabled         bool      `gorm:"default:false" json:"enabled"`
+	Enabled         bool      `gorm:"default:false;index" json:"enabled"`
 	Timezone        string    `gorm:"size:64;default:'Asia/Kolkata'" json:"timezone"`
-	SendTime        string    `gorm:"size:5;default:'20:00'" json:"send_time"` // HH:MM local
+	SendTime        string    `gorm:"size:8;default:'20:00'" json:"send_time"` // HH:MM local (normalized)
 	ReportLanguage  string    `gorm:"size:10;default:'en'" json:"report_language"`
 
 	// Dedicated AI settings for daily reports (independent of chatbot settings UI).
@@ -62,6 +62,12 @@ type DailyReportSettings struct {
 	AIMaxTokens    int     `gorm:"default:3000" json:"ai_max_tokens"`
 	AITemperature  float64 `gorm:"type:decimal(3,2);default:0.3" json:"ai_temperature"`
 	AISystemPrompt string  `gorm:"type:text" json:"ai_system_prompt"`
+
+	// Persistent schedule audit (updated after each scheduled fire).
+	LastScheduledAt     *time.Time `json:"last_scheduled_at,omitempty"`
+	LastScheduledDate   string     `gorm:"size:10" json:"last_scheduled_date,omitempty"` // YYYY-MM-DD
+	LastScheduledStatus string     `gorm:"size:20" json:"last_scheduled_status,omitempty"`
+	LastScheduledRunID  *uuid.UUID `gorm:"type:uuid" json:"last_scheduled_run_id,omitempty"`
 
 	Organization *Organization          `gorm:"foreignKey:OrganizationID" json:"organization,omitempty"`
 	Recipients   []DailyReportRecipient `gorm:"foreignKey:SettingsID" json:"recipients,omitempty"`

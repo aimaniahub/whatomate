@@ -462,6 +462,20 @@ export interface DailyReportSettings {
   recipients: DailyReportRecipient[]
   next_run_preview?: string
   max_recipients: number
+  // Schedule status
+  schedule_active?: boolean
+  schedule_cadence?: string
+  next_fire_at?: string
+  next_send_at?: string
+  last_scheduled_at?: string
+  last_scheduled_date?: string
+  last_scheduled_status?: string
+  last_scheduled_run_id?: string
+  today_report_date?: string
+  today_run_status?: string
+  today_run_triggered_by?: string
+  today_run_id?: string
+  schedule_lead_minutes?: number
   // Dedicated AI on this page
   ai_enabled: boolean
   ai_provider: string

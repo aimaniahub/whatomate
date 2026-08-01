@@ -28,16 +28,31 @@ type DailyReportSettingsResponse struct {
 	NextRunPreview  string                    `json:"next_run_preview,omitempty"`
 	MaxRecipients   int                       `json:"max_recipients"`
 
+	// Schedule status for UI (persistent + computed)
+	ScheduleActive          bool    `json:"schedule_active"`
+	ScheduleCadence         string  `json:"schedule_cadence"` // human text
+	NextFireAt              string  `json:"next_fire_at,omitempty"`
+	NextSendAt              string  `json:"next_send_at,omitempty"`
+	LastScheduledAt         string  `json:"last_scheduled_at,omitempty"`
+	LastScheduledDate       string  `json:"last_scheduled_date,omitempty"`
+	LastScheduledStatus     string  `json:"last_scheduled_status,omitempty"`
+	LastScheduledRunID      string  `json:"last_scheduled_run_id,omitempty"`
+	TodayReportDate         string  `json:"today_report_date,omitempty"`
+	TodayRunStatus          string  `json:"today_run_status,omitempty"`
+	TodayRunTriggeredBy     string  `json:"today_run_triggered_by,omitempty"`
+	TodayRunID              string  `json:"today_run_id,omitempty"`
+	ScheduleLeadMinutes     int     `json:"schedule_lead_minutes"`
+
 	// Dedicated AI (this page) — API key never returned in full
-	AIEnabled         bool    `json:"ai_enabled"`
-	AIProvider        string  `json:"ai_provider"`
-	AIModel           string  `json:"ai_model"`
-	AIMaxTokens       int     `json:"ai_max_tokens"`
-	AITemperature     float64 `json:"ai_temperature"`
-	AISystemPrompt    string  `json:"ai_system_prompt"`
-	AIHasAPIKey       bool    `json:"ai_has_api_key"`
-	AIDefaultPrompt   string  `json:"ai_default_prompt"`
-	AIReady           bool    `json:"ai_ready"`
+	AIEnabled       bool    `json:"ai_enabled"`
+	AIProvider      string  `json:"ai_provider"`
+	AIModel         string  `json:"ai_model"`
+	AIMaxTokens     int     `json:"ai_max_tokens"`
+	AITemperature   float64 `json:"ai_temperature"`
+	AISystemPrompt  string  `json:"ai_system_prompt"`
+	AIHasAPIKey     bool    `json:"ai_has_api_key"`
+	AIDefaultPrompt string  `json:"ai_default_prompt"`
+	AIReady         bool    `json:"ai_ready"`
 }
 
 // DailyReportRecipientDTO is a setup recipient.
@@ -105,7 +120,7 @@ func (a *App) GetDailyReportSettings(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load recipients", nil, "")
 	}
 
-	return r.SendEnvelope(toDailySettingsResponse(s, recipients))
+	return r.SendEnvelope(a.toDailySettingsResponse(s, recipients))
 }
 
 // UpdateDailyReportSettings saves setup (max 2 recipients).
@@ -125,10 +140,13 @@ func (a *App) UpdateDailyReportSettings(r *fastglue.Request) error {
 	if len(req.Recipients) > models.MaxDailyReportRecipients {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Maximum 2 recipients allowed", nil, "")
 	}
+	normalizedSend := ""
 	if req.SendTime != "" {
-		if _, _, err := dailyreport.ParseSendTime(req.SendTime); err != nil {
+		norm, err := dailyreport.NormalizeSendTime(req.SendTime)
+		if err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "send_time must be HH:MM", nil, "")
 		}
+		normalizedSend = norm
 	}
 	tz := strings.TrimSpace(req.Timezone)
 	if tz == "" {
@@ -155,8 +173,8 @@ func (a *App) UpdateDailyReportSettings(r *fastglue.Request) error {
 
 	s.WhatsAppAccount = strings.TrimSpace(req.WhatsAppAccount)
 	s.Timezone = tz
-	if req.SendTime != "" {
-		s.SendTime = req.SendTime
+	if normalizedSend != "" {
+		s.SendTime = normalizedSend
 	}
 	if req.ReportLanguage != "" {
 		s.ReportLanguage = req.ReportLanguage
@@ -245,7 +263,7 @@ func (a *App) UpdateDailyReportSettings(r *fastglue.Request) error {
 
 	var recipients []models.DailyReportRecipient
 	_ = a.DB.Where("settings_id = ?", s.ID).Order("sort_order asc").Find(&recipients).Error
-	return r.SendEnvelope(toDailySettingsResponse(s, recipients))
+	return r.SendEnvelope(a.toDailySettingsResponse(s, recipients))
 }
 
 // ListDailyReportRuns returns recent runs.
@@ -420,7 +438,7 @@ func (a *App) ResendDailyReport(r *fastglue.Request) error {
 	return r.SendEnvelope(toDailyRunDTO(run))
 }
 
-func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.DailyReportRecipient) DailyReportSettingsResponse {
+func (a *App) toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.DailyReportRecipient) DailyReportSettingsResponse {
 	dto := make([]DailyReportRecipientDTO, 0, len(recipients))
 	for _, r := range recipients {
 		dto = append(dto, DailyReportRecipientDTO{
@@ -436,17 +454,44 @@ func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.
 		tz = models.DefaultDailyReportTimezone
 	}
 	sendTime := s.SendTime
-	if sendTime == "" {
+	if norm, err := dailyreport.NormalizeSendTime(sendTime); err == nil {
+		sendTime = norm
+	} else if sendTime == "" {
 		sendTime = models.DefaultDailyReportSendTime
 	}
 	loc := dailyreport.LoadLocation(tz)
+	now := time.Now()
 	today := dailyreport.TodayDate(loc)
-	// Scheduler starts AI 10 minutes before send_time so PDF is ready.
-	prepareAt, err := dailyreport.PrepareAt(time.Now(), loc, sendTime, dailyreport.ScheduleLeadMinutes)
-	preview := today + " send " + sendTime + " " + tz
-	if err == nil {
-		preview = fmt.Sprintf("%s · AI starts %s (send %s %s)",
-			today, prepareAt.Format("15:04"), sendTime, tz)
+
+	preview := fmt.Sprintf("Daily at %s %s", sendTime, tz)
+	nextFire := ""
+	nextSend := ""
+	if s.Enabled {
+		if nf, err := dailyreport.NextFireTime(now, loc, sendTime, dailyreport.ScheduleLeadMinutes); err == nil {
+			nextFire = nf.Format(time.RFC3339)
+			preview = fmt.Sprintf("Every day · next run %s · send %s %s",
+				nf.In(loc).Format("02 Jan 15:04"), sendTime, tz)
+		}
+		if sa, err := dailyreport.SendAt(now, loc, sendTime); err == nil {
+			local := now.In(loc)
+			if !local.Before(sa) {
+				sa = sa.Add(24 * time.Hour)
+			}
+			nextSend = sa.Format(time.RFC3339)
+		}
+	} else {
+		preview = fmt.Sprintf("Schedule off · would run daily at %s %s when enabled", sendTime, tz)
+	}
+
+	todayStatus, todayTrig, todayRunID := "", "", ""
+	var todayRun models.DailyReportRun
+	if a != nil && a.DB != nil {
+		if err := a.DB.Where("organization_id = ? AND report_date = ?", s.OrganizationID, today).
+			Order("created_at desc").First(&todayRun).Error; err == nil {
+			todayStatus = todayRun.Status
+			todayTrig = todayRun.TriggeredBy
+			todayRunID = todayRun.ID.String()
+		}
 	}
 
 	prompt := s.AISystemPrompt
@@ -462,7 +507,7 @@ func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.
 		temp = 0.3
 	}
 
-	return DailyReportSettingsResponse{
+	resp := DailyReportSettingsResponse{
 		ID:              s.ID.String(),
 		OrganizationID:  s.OrganizationID.String(),
 		WhatsAppAccount: s.WhatsAppAccount,
@@ -474,6 +519,18 @@ func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.
 		NextRunPreview:  preview,
 		MaxRecipients:   models.MaxDailyReportRecipients,
 
+		ScheduleActive:      s.Enabled,
+		ScheduleCadence:     fmt.Sprintf("Every day at %s (%s)", sendTime, tz),
+		NextFireAt:          nextFire,
+		NextSendAt:          nextSend,
+		LastScheduledDate:   s.LastScheduledDate,
+		LastScheduledStatus: s.LastScheduledStatus,
+		TodayReportDate:     today,
+		TodayRunStatus:      todayStatus,
+		TodayRunTriggeredBy: todayTrig,
+		TodayRunID:          todayRunID,
+		ScheduleLeadMinutes: dailyreport.ScheduleLeadMinutes,
+
 		AIEnabled:       s.AIEnabled,
 		AIProvider:      s.AIProvider,
 		AIModel:         s.AIModel,
@@ -484,6 +541,13 @@ func toDailySettingsResponse(s *models.DailyReportSettings, recipients []models.
 		AIDefaultPrompt: models.DefaultDailyReportAISystemPrompt,
 		AIReady:         s.DailyReportAIReady(),
 	}
+	if s.LastScheduledAt != nil {
+		resp.LastScheduledAt = s.LastScheduledAt.UTC().Format(time.RFC3339)
+	}
+	if s.LastScheduledRunID != nil {
+		resp.LastScheduledRunID = s.LastScheduledRunID.String()
+	}
+	return resp
 }
 
 func toDailyRunDTO(run models.DailyReportRun) DailyReportRunDTO {
