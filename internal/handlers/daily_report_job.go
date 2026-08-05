@@ -186,18 +186,21 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		return nil, 0, err
 	}
 
-	// GORM maps WhatsAppAccount → column whats_app_account (not whatsapp_account).
+	// GORM maps WhatsAppAccount → column whats_app_account.
+	// Prefer selected WhatsApp account; if empty, include all accounts for the org.
 	type row struct {
-		ContactID   uuid.UUID
-		ProfileName string
-		PhoneNumber string
-		Direction   models.Direction
-		Content     string
-		CreatedAt   time.Time
+		ContactID    uuid.UUID
+		ProfileName  string
+		PhoneNumber  string
+		Direction    models.Direction
+		Content      string
+		MessageType  models.MessageType
+		TemplateName string
+		CreatedAt    time.Time
 	}
 
 	q := a.DB.Model(&models.Message{}).
-		Select("messages.contact_id, contacts.profile_name, contacts.phone_number, messages.direction, messages.content, messages.created_at").
+		Select("messages.contact_id, contacts.profile_name, contacts.phone_number, messages.direction, messages.content, messages.message_type, messages.template_name, messages.created_at").
 		Joins("JOIN contacts ON contacts.id = messages.contact_id AND contacts.deleted_at IS NULL").
 		Where("messages.organization_id = ? AND messages.deleted_at IS NULL", orgID).
 		Where("messages.created_at >= ? AND messages.created_at < ?", start, end).
@@ -211,6 +214,16 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 	if err := q.Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
+
+	a.Log.Info("Daily report collect diagnostics",
+		"org", orgID,
+		"report_date", reportDate,
+		"timezone", loc.String(),
+		"start_utc", start.UTC().Format(time.RFC3339),
+		"end_utc", end.UTC().Format(time.RFC3339),
+		"account_filter", strings.TrimSpace(waAccount),
+		"raw_rows", len(rows),
+	)
 
 	byContact := map[uuid.UUID]*dailyreport.ContactChat{}
 	order := make([]uuid.UUID, 0)
@@ -241,11 +254,35 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 			continue
 		}
 		text := strings.TrimSpace(r.Content)
+		if text == "" {
+			// Enrich non-text / interactive rows so AI still has something useful.
+			switch r.MessageType {
+			case models.MessageTypeInteractive:
+				text = "[interactive reply]"
+			case models.MessageTypeImage:
+				text = "[image]"
+			case models.MessageTypeDocument:
+				text = "[document]"
+			case models.MessageTypeAudio:
+				text = "[audio]"
+			case models.MessageTypeVideo:
+				text = "[video]"
+			case models.MessageTypeTemplate:
+				if r.TemplateName != "" {
+					text = "[template: " + r.TemplateName + "]"
+				} else {
+					text = "[template]"
+				}
+			default:
+				if r.MessageType != "" {
+					text = "[" + string(r.MessageType) + "]"
+				} else {
+					text = "[message]"
+				}
+			}
+		}
 		if utf8.RuneCountInString(text) > maxMsgChars {
 			text = string([]rune(text)[:maxMsgChars]) + "..."
-		}
-		if text == "" {
-			text = "[non-text message]"
 		}
 		cc.Messages = append(cc.Messages, dailyreport.ChatMessage{
 			Direction: string(r.Direction),
@@ -448,20 +485,78 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 		return 0, []string{err.Error()}
 	}
 
-	caption := fmt.Sprintf("Daily chat report — %s", run.ReportDate)
-	if data.EmptyDay {
-		caption = fmt.Sprintf("Daily chat report — %s (no chats)", run.ReportDate)
-	} else {
-		caption = fmt.Sprintf("Daily chat report — %s (%d chats)", run.ReportDate, data.Overview.TotalChats)
-		if data.AIUsed {
-			caption += " · AI ready"
+	// Prefer approved UTILITY template with DOCUMENT header (works outside 24h window).
+	tplName := strings.TrimSpace(settings.ReportTemplateName)
+	tplLang := strings.TrimSpace(settings.ReportTemplateLanguage)
+	if tplLang == "" {
+		tplLang = "en"
+	}
+
+	var template *models.Template
+	if tplName != "" {
+		var t models.Template
+		q := a.DB.Where("organization_id = ? AND name = ? AND whats_app_account = ?",
+			settings.OrganizationID, tplName, account.Name)
+		if err := q.First(&t).Error; err != nil {
+			// Fall back: any language match / without account
+			err2 := a.DB.Where("organization_id = ? AND name = ?", settings.OrganizationID, tplName).
+				Order(fmt.Sprintf("CASE WHEN language = '%s' THEN 0 ELSE 1 END", strings.ReplaceAll(tplLang, "'", ""))).
+				First(&t).Error
+			if err2 != nil {
+				errs = append(errs, fmt.Sprintf("template %q not found for account %s — create & sync an APPROVED utility DOCUMENT template", tplName, account.Name))
+			} else {
+				template = &t
+			}
+		} else {
+			template = &t
 		}
+		if template != nil && !strings.EqualFold(template.Status, "APPROVED") {
+			errs = append(errs, fmt.Sprintf("template %q status is %s (need APPROVED)", tplName, template.Status))
+			template = nil
+		}
+		if template != nil && !strings.EqualFold(template.HeaderType, "DOCUMENT") {
+			errs = append(errs, fmt.Sprintf("template %q header is %q (need DOCUMENT)", tplName, template.HeaderType))
+			template = nil
+		}
+	} else {
+		errs = append(errs, "no report template configured — free-form document only works inside WhatsApp 24h window")
 	}
 
 	mime := "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	if strings.HasSuffix(strings.ToLower(filename), ".pdf") {
 		mime = "application/pdf"
 	}
+
+	// Upload media once for template header (reused for all recipients).
+	var headerMediaID string
+	if template != nil && len(fileBytes) > 0 {
+		waAcct := a.toWhatsAppAccount(account)
+		ctxUp, cancelUp := context.WithTimeout(context.Background(), 60*time.Second)
+		id, upErr := a.WhatsApp.UploadMedia(ctxUp, waAcct, fileBytes, mime, filename)
+		cancelUp()
+		if upErr != nil {
+			errs = append(errs, "upload report media: "+upErr.Error())
+			template = nil // fall back to free-form attempt
+		} else {
+			headerMediaID = id
+		}
+	}
+
+	reportType := "Daily chat report"
+	if data.EmptyDay || data.Overview.TotalChats == 0 {
+		reportType = "Daily chat report (no chats)"
+	}
+	bodyParams := map[string]string{
+		"1": run.ReportDate,
+		"2": fmt.Sprintf("%d", data.Overview.TotalChats),
+		"3": reportType,
+	}
+	// Also support named-style keys some templates use
+	bodyParams["date"] = bodyParams["1"]
+	bodyParams["chat_count"] = bodyParams["2"]
+	bodyParams["report_type"] = bodyParams["3"]
+
+	caption := fmt.Sprintf("%s — %s (%d chats)", reportType, run.ReportDate, data.Overview.TotalChats)
 
 	active := 0
 	for _, r := range settings.Recipients {
@@ -488,20 +583,57 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 			contact.WhatsAppAccount = account.Name
 		}
 
-		req := OutgoingMessageRequest{
-			Account:       account,
-			Contact:       contact,
-			Type:          models.MessageTypeDocument,
-			MediaData:     fileBytes,
-			MediaMimeType: mime,
-			MediaFilename: filename,
-			Caption:       caption,
-		}
+		var sendErr error
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		_, sendErr := a.SendOutgoingMessage(ctx, req, DefaultSendOptions())
+		if template != nil && headerMediaID != "" {
+			// Cold-send path: utility template + DOCUMENT header (outside 24h OK).
+			req := OutgoingMessageRequest{
+				Account:             account,
+				Contact:             contact,
+				Type:                models.MessageTypeTemplate,
+				Template:            template,
+				BodyParams:          bodyParams,
+				HeaderMediaID:       headerMediaID,
+				HeaderMediaFilename: filename,
+				MediaMimeType:       mime,
+			}
+			_, sendErr = a.SendOutgoingMessage(ctx, req, DefaultSendOptions())
+			if sendErr != nil {
+				a.Log.Warn("Daily report template send failed; trying free-form document",
+					"recipient", r.Name, "error", sendErr)
+				// Fall through to free-form for this recipient
+				req2 := OutgoingMessageRequest{
+					Account:       account,
+					Contact:       contact,
+					Type:          models.MessageTypeDocument,
+					MediaData:     fileBytes,
+					MediaMimeType: mime,
+					MediaFilename: filename,
+					Caption:       caption,
+				}
+				_, sendErr = a.SendOutgoingMessage(ctx, req2, DefaultSendOptions())
+			}
+		} else {
+			// Free-form document — only works if recipient messaged within 24h.
+			req := OutgoingMessageRequest{
+				Account:       account,
+				Contact:       contact,
+				Type:          models.MessageTypeDocument,
+				MediaData:     fileBytes,
+				MediaMimeType: mime,
+				MediaFilename: filename,
+				Caption:       caption,
+			}
+			_, sendErr = a.SendOutgoingMessage(ctx, req, DefaultSendOptions())
+		}
 		cancel()
+
 		if sendErr != nil {
-			errs = append(errs, fmt.Sprintf("%s (%s): %v", r.Name, phone, sendErr))
+			msg := fmt.Sprintf("%s (%s): %v", r.Name, phone, sendErr)
+			if strings.Contains(strings.ToLower(sendErr.Error()), "24") || strings.Contains(sendErr.Error(), "131047") {
+				msg += " [outside WhatsApp 24h window — configure APPROVED utility DOCUMENT template on Daily Reports setup]"
+			}
+			errs = append(errs, msg)
 			a.Log.Error("Daily report send failed", "recipient", r.Name, "phone", phone, "error", sendErr)
 			continue
 		}

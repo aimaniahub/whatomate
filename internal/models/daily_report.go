@@ -48,11 +48,17 @@ Rules:
 type DailyReportSettings struct {
 	BaseModel
 	OrganizationID  uuid.UUID `gorm:"type:uuid;uniqueIndex;not null" json:"organization_id"`
-	WhatsAppAccount string    `gorm:"size:100" json:"whatsapp_account"` // Account used to send the PDF
+	WhatsAppAccount string    `gorm:"size:100" json:"whatsapp_account"` // Account used to send + filter chats
 	Enabled         bool      `gorm:"default:false;index" json:"enabled"`
 	Timezone        string    `gorm:"size:64;default:'Asia/Kolkata'" json:"timezone"`
 	SendTime        string    `gorm:"size:8;default:'20:00'" json:"send_time"` // HH:MM local (normalized)
 	ReportLanguage  string    `gorm:"size:10;default:'en'" json:"report_language"`
+
+	// Utility template for sending outside the 24h WhatsApp session window.
+	// Must be APPROVED, category UTILITY, header type DOCUMENT.
+	// Body variables (recommended): {{1}}=report date, {{2}}=chat count, {{3}}=report type label.
+	ReportTemplateName     string `gorm:"size:255" json:"report_template_name"`
+	ReportTemplateLanguage string `gorm:"size:20;default:'en'" json:"report_template_language"`
 
 	// Dedicated AI settings for daily reports (independent of chatbot settings UI).
 	AIEnabled      bool    `gorm:"default:false" json:"ai_enabled"`

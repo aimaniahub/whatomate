@@ -462,6 +462,10 @@ export interface DailyReportSettings {
   recipients: DailyReportRecipient[]
   next_run_preview?: string
   max_recipients: number
+  report_template_name?: string
+  report_template_language?: string
+  template_configured?: boolean
+  delivery_mode?: string
   // Schedule status
   schedule_active?: boolean
   schedule_cadence?: string
@@ -514,6 +518,8 @@ export const dailyReportsService = {
     send_time?: string
     report_language?: string
     recipients: DailyReportRecipient[]
+    report_template_name?: string
+    report_template_language?: string
     ai_enabled?: boolean
     ai_provider?: string
     ai_api_key?: string

@@ -28,6 +28,12 @@ type DailyReportSettingsResponse struct {
 	NextRunPreview  string                    `json:"next_run_preview,omitempty"`
 	MaxRecipients   int                       `json:"max_recipients"`
 
+	// WhatsApp utility template (DOCUMENT header) for cold sends outside 24h window
+	ReportTemplateName     string `json:"report_template_name"`
+	ReportTemplateLanguage string `json:"report_template_language"`
+	TemplateConfigured     bool   `json:"template_configured"`
+	DeliveryMode           string `json:"delivery_mode"` // template | freeform | none
+
 	// Schedule status for UI (persistent + computed)
 	ScheduleActive          bool    `json:"schedule_active"`
 	ScheduleCadence         string  `json:"schedule_cadence"` // human text
@@ -72,6 +78,9 @@ type UpdateDailyReportSettingsRequest struct {
 	SendTime        string                    `json:"send_time"`
 	ReportLanguage  string                    `json:"report_language"`
 	Recipients      []DailyReportRecipientDTO `json:"recipients"`
+
+	ReportTemplateName     *string `json:"report_template_name"`
+	ReportTemplateLanguage *string `json:"report_template_language"`
 
 	AIEnabled      *bool    `json:"ai_enabled"`
 	AIProvider     *string  `json:"ai_provider"`
@@ -181,6 +190,16 @@ func (a *App) UpdateDailyReportSettings(r *fastglue.Request) error {
 	}
 	if req.Enabled != nil {
 		s.Enabled = *req.Enabled
+	}
+	if req.ReportTemplateName != nil {
+		s.ReportTemplateName = strings.TrimSpace(*req.ReportTemplateName)
+	}
+	if req.ReportTemplateLanguage != nil {
+		lang := strings.TrimSpace(*req.ReportTemplateLanguage)
+		if lang == "" {
+			lang = "en"
+		}
+		s.ReportTemplateLanguage = lang
 	}
 
 	// AI settings (dedicated to daily reports)
@@ -507,6 +526,18 @@ func (a *App) toDailySettingsResponse(s *models.DailyReportSettings, recipients 
 		temp = 0.3
 	}
 
+	tplName := strings.TrimSpace(s.ReportTemplateName)
+	tplLang := strings.TrimSpace(s.ReportTemplateLanguage)
+	if tplLang == "" {
+		tplLang = "en"
+	}
+	deliveryMode := "none"
+	if tplName != "" {
+		deliveryMode = "template"
+	} else if s.WhatsAppAccount != "" || true {
+		deliveryMode = "freeform"
+	}
+
 	resp := DailyReportSettingsResponse{
 		ID:              s.ID.String(),
 		OrganizationID:  s.OrganizationID.String(),
@@ -518,6 +549,11 @@ func (a *App) toDailySettingsResponse(s *models.DailyReportSettings, recipients 
 		Recipients:      dto,
 		NextRunPreview:  preview,
 		MaxRecipients:   models.MaxDailyReportRecipients,
+
+		ReportTemplateName:     tplName,
+		ReportTemplateLanguage: tplLang,
+		TemplateConfigured:     tplName != "",
+		DeliveryMode:           deliveryMode,
 
 		ScheduleActive:      s.Enabled,
 		ScheduleCadence:     fmt.Sprintf("Every day at %s (%s)", sendTime, tz),

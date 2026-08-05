@@ -58,6 +58,8 @@ const form = ref({
   send_time: '20:00',
   whatsapp_account: '',
   recipients: [] as DailyReportRecipient[],
+  report_template_name: 'daily_chat_report',
+  report_template_language: 'en',
   ai_enabled: false,
   ai_provider: 'openrouter',
   ai_api_key: '',
@@ -95,6 +97,8 @@ async function load() {
         is_active: r.is_active !== false,
         sort_order: r.sort_order
       })),
+      report_template_name: s.report_template_name || 'daily_chat_report',
+      report_template_language: s.report_template_language || 'en',
       ai_enabled: !!s.ai_enabled,
       ai_provider: s.ai_provider || 'openrouter',
       ai_api_key: '', // never preload secret; leave blank to keep existing
@@ -155,6 +159,8 @@ async function saveSettings() {
         is_active: r.is_active,
         sort_order: i
       })),
+      report_template_name: form.value.report_template_name.trim(),
+      report_template_language: form.value.report_template_language.trim() || 'en',
       ai_enabled: form.value.ai_enabled,
       ai_provider: form.value.ai_provider,
       ai_model: form.value.ai_model,
@@ -412,7 +418,7 @@ onMounted(load)
                 <Input v-model="form.send_time" type="time" :disabled="!canWrite" />
               </div>
               <div class="space-y-2">
-                <Label>WhatsApp account (sender)</Label>
+                <Label>WhatsApp account (sender + chat source)</Label>
                 <Select
                   v-if="accounts.length"
                   :model-value="form.whatsapp_account"
@@ -434,6 +440,61 @@ onMounted(load)
                   :disabled="!canWrite"
                   placeholder="Account name"
                 />
+                <p class="text-xs text-muted-foreground">
+                  Chats for this account are included. Report is sent from this account.
+                </p>
+              </div>
+            </div>
+
+            <!-- Utility template (required for send outside 24h window) -->
+            <div class="space-y-3 rounded-lg border p-4">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 class="text-sm font-semibold">WhatsApp utility template (DOCUMENT)</h3>
+                  <p class="text-xs text-muted-foreground">
+                    Required so admins receive the report outside the 24-hour session window. Only the
+                    recipients listed below get the message.
+                  </p>
+                </div>
+                <Badge :variant="settings?.template_configured ? 'default' : 'secondary'">
+                  {{ settings?.template_configured ? 'Template set' : 'Not configured' }}
+                </Badge>
+              </div>
+              <div class="grid gap-4 sm:grid-cols-2">
+                <div class="space-y-2">
+                  <Label>Template name</Label>
+                  <Input
+                    v-model="form.report_template_name"
+                    :disabled="!canWrite"
+                    placeholder="daily_chat_report"
+                  />
+                </div>
+                <div class="space-y-2">
+                  <Label>Language code</Label>
+                  <Input
+                    v-model="form.report_template_language"
+                    :disabled="!canWrite"
+                    placeholder="en"
+                  />
+                </div>
+              </div>
+              <div class="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground space-y-1">
+                <p class="font-medium text-foreground">Create this in Meta Business Manager → Message templates:</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li>Category: <strong>UTILITY</strong></li>
+                  <li>Name: e.g. <code>daily_chat_report</code> (must match field above)</li>
+                  <li>Header: <strong>Document</strong></li>
+                  <li>
+                    Body example:
+                    <code>Here is your {{3}} for {{1}}. Chats today: {{2}}.</code>
+                  </li>
+                  <li>Variables: <code>1</code>=date, <code>2</code>=chat count, <code>3</code>=report type</li>
+                  <li>Submit → wait for <strong>APPROVED</strong> → Sync templates in Whatomate</li>
+                </ul>
+                <p>
+                  After approval, Save setup here, then Run now. The DOCX is attached as the template
+                  document header and sent only to configured recipients.
+                </p>
               </div>
             </div>
 
