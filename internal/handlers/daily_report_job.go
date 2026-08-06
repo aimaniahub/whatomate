@@ -14,6 +14,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/dailyreport"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -26,7 +27,8 @@ const (
 )
 
 // RunDailyReport generates the DOCX for reportDate and sends it to active recipients.
-// It always runs AI first when there are chats (fails clearly if AI is not configured).
+// With chats: tries page AI (or chatbot AI), then rule-based fallback so DOCX always has rows.
+// Empty days still produce a "no chats" DOCX and attempt template notify.
 // reportDate is YYYY-MM-DD in the settings timezone. Idempotent for schedule unless force.
 func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, force bool) (*models.DailyReportRun, error) {
 	settings, err := a.getOrCreateDailyReportSettings(orgID)
@@ -81,13 +83,46 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		}
 	}
 
+	// Claim run as running. With force (manual), always overwrite.
+	// Without force, only claim if not terminal and not a fresh running job (race-safe).
 	now := time.Now()
-	run.Status = models.DailyReportStatusRunning
-	run.TriggeredBy = triggeredBy
-	run.StartedAt = &now
-	run.ErrorMessage = ""
-	run.SendErrors = ""
-	if err := a.DB.Save(&run).Error; err != nil {
+	staleBefore := now.Add(-30 * time.Minute)
+	updates := map[string]any{
+		"status":        models.DailyReportStatusRunning,
+		"triggered_by":  triggeredBy,
+		"started_at":    now,
+		"error_message": "",
+		"send_errors":   "",
+	}
+	q := a.DB.Model(&models.DailyReportRun{}).Where("id = ?", run.ID)
+	if !force {
+		q = q.Where(
+			"status NOT IN ? AND (status <> ? OR started_at IS NULL OR started_at < ?)",
+			[]string{models.DailyReportStatusCompleted, models.DailyReportStatusEmpty},
+			models.DailyReportStatusRunning,
+			staleBefore,
+		)
+	}
+	claim := q.Updates(updates)
+	if claim.Error != nil {
+		return nil, claim.Error
+	}
+	if claim.RowsAffected == 0 {
+		if err := a.DB.Where("id = ?", run.ID).First(&run).Error; err != nil {
+			return nil, err
+		}
+		if run.Status == models.DailyReportStatusCompleted || run.Status == models.DailyReportStatusEmpty {
+			return &run, nil
+		}
+		if run.Status == models.DailyReportStatusRunning {
+			return &run, fmt.Errorf("report already running for %s", reportDate)
+		}
+		// Unexpected status — last-chance claim
+		if err := a.DB.Model(&run).Updates(updates).Error; err != nil {
+			return nil, err
+		}
+	}
+	if err := a.DB.Where("id = ?", run.ID).First(&run).Error; err != nil {
 		return nil, err
 	}
 
@@ -129,11 +164,23 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		var sumErr error
 		reportData, aiModel, sumErr = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
 		if sumErr != nil {
-			a.Log.Error("Daily report AI failed", "org", orgID, "error", sumErr)
-			return fail("AI summarize failed: " + sumErr.Error() + ". Configure AI on the Daily Reports page (provider, model, API key) and enable AI.")
+			// Production: still ship a filled DOCX so ops get contact list + rule-based bullets.
+			a.Log.Error("Daily report AI failed; using rule-based summaries",
+				"org", orgID, "error", sumErr, "chats", len(chats))
+			reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
+			reportData.GeneratedAt = genAt
+			aiModel = "fallback"
+			run.ErrorMessage = "AI summarize failed (used rule-based summaries): " + sumErr.Error()
+		} else {
+			a.Log.Info("Daily report: AI summarize complete",
+				"org", orgID, "model", aiModel, "rows", len(reportData.Chats), "ai_used", reportData.AIUsed)
 		}
-		a.Log.Info("Daily report: AI summarize complete",
-			"org", orgID, "model", aiModel, "rows", len(reportData.Chats), "ai_used", reportData.AIUsed)
+		// Safety: never emit empty chat list when we collected contacts.
+		if len(reportData.Chats) == 0 && len(chats) > 0 {
+			reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
+			reportData.GeneratedAt = genAt
+			aiModel = "fallback"
+		}
 	}
 	run.AIModel = aiModel
 
@@ -485,53 +532,16 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 		return 0, []string{err.Error()}
 	}
 
-	// Prefer approved UTILITY template with TEXT (or empty) header — works outside 24h.
-	// Free-form DOCX is attempted only if the recipient already has an open 24h session.
-	tplName := strings.TrimSpace(settings.ReportTemplateName)
-	tplLang := strings.TrimSpace(settings.ReportTemplateLanguage)
-	if tplLang == "" {
-		tplLang = "en"
-	}
-
-	var template *models.Template
-	if tplName != "" {
-		var t models.Template
-		q := a.DB.Where("organization_id = ? AND name = ? AND whats_app_account = ?",
-			settings.OrganizationID, tplName, account.Name)
-		if err := q.First(&t).Error; err != nil {
-			err2 := a.DB.Where("organization_id = ? AND name = ?", settings.OrganizationID, tplName).
-				Order(fmt.Sprintf("CASE WHEN language = '%s' THEN 0 ELSE 1 END", strings.ReplaceAll(tplLang, "'", ""))).
-				First(&t).Error
-			if err2 != nil {
-				errs = append(errs, fmt.Sprintf("template %q not found for account %s — create & sync an APPROVED utility TEXT template", tplName, account.Name))
-			} else {
-				template = &t
-			}
-		} else {
-			template = &t
-		}
-		if template != nil && !strings.EqualFold(template.Status, "APPROVED") {
-			errs = append(errs, fmt.Sprintf("template %q status is %s (need APPROVED)", tplName, template.Status))
-			template = nil
-		}
-		// Accept TEXT or empty/none header. DOCUMENT is still supported if user prefers attach-in-header.
-		if template != nil {
-			ht := strings.ToUpper(strings.TrimSpace(template.HeaderType))
-			if ht != "" && ht != "TEXT" && ht != "NONE" && ht != "DOCUMENT" {
-				errs = append(errs, fmt.Sprintf("template %q header is %q (use TEXT or DOCUMENT)", tplName, template.HeaderType))
-				template = nil
-			}
-		}
-	} else {
-		errs = append(errs, "no report template configured — free-form document only works inside WhatsApp 24h window")
-	}
+	// Load selected APPROVED template (dropdown on Daily Reports page).
+	// TEXT header = notify outside 24h; DOCUMENT header can attach the report file.
+	template, tplErrs := a.loadDailyReportTemplate(settings, account.Name)
+	errs = append(errs, tplErrs...)
 
 	mime := "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	if strings.HasSuffix(strings.ToLower(filename), ".pdf") {
 		mime = "application/pdf"
 	}
 
-	// DOCUMENT header only: upload media once for template attachment.
 	var headerMediaID string
 	useDocHeader := template != nil && strings.EqualFold(template.HeaderType, "DOCUMENT")
 	if useDocHeader && len(fileBytes) > 0 {
@@ -541,7 +551,6 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 		cancelUp()
 		if upErr != nil {
 			errs = append(errs, "upload report media: "+upErr.Error())
-			template = nil
 			useDocHeader = false
 		} else {
 			headerMediaID = id
@@ -552,15 +561,11 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 	if data.EmptyDay || data.Overview.TotalChats == 0 {
 		reportType = "Daily chat report (no chats)"
 	}
-	// Body positional params (match Meta body {{1}} {{2}} {{3}}).
-	// Header TEXT may use its own {{1}} — filled via HeaderParams below.
-	bodyParams := map[string]string{
-		"1": run.ReportDate,
-		"2": fmt.Sprintf("%d", data.Overview.TotalChats),
-		"3": reportType,
-	}
-	headerParams := map[string]string{
-		"1": reportType, // if header is e.g. "{{1}}" or "Report: {{1}}"
+	bodyParams := map[string]string{}
+	headerParams := map[string]string{}
+	if template != nil {
+		bodyParams = buildDailyReportTemplateParams(template.BodyContent, run.ReportDate, data.Overview.TotalChats, reportType)
+		headerParams = buildDailyReportTemplateParams(template.HeaderContent, run.ReportDate, data.Overview.TotalChats, reportType)
 	}
 
 	caption := fmt.Sprintf("%s — %s (%d chats)", reportType, run.ReportDate, data.Overview.TotalChats)
@@ -590,10 +595,12 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 			contact.WhatsAppAccount = account.Name
 		}
 
-		var sendErr error
+		templateOK := false
+		docOK := false
+		var lastErr error
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 
-		// 1) Utility template (TEXT header recommended) — works outside 24h.
+		// 1) Selected utility/text template — works outside 24h.
 		if template != nil {
 			req := OutgoingMessageRequest{
 				Account:      account,
@@ -608,16 +615,17 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 				req.HeaderMediaFilename = filename
 				req.MediaMimeType = mime
 			}
-			_, sendErr = a.SendOutgoingMessage(ctx, req, DefaultSendOptions())
-			if sendErr != nil {
-				a.Log.Warn("Daily report template send failed", "recipient", r.Name, "error", sendErr)
+			if _, err := a.SendOutgoingMessage(ctx, req, DefaultSendOptions()); err != nil {
+				lastErr = err
+				a.Log.Warn("Daily report template send failed", "recipient", r.Name, "error", err)
+			} else {
+				templateOK = true
 			}
 		}
 
-		// 2) Free-form DOCX only if session window is already open (customer messaged us within 24h).
-		// Sending a template does NOT open free-form outbound; only customer inbound does.
+		// 2) Free-form DOCX only inside open 24h window (customer inbound required).
 		windowOpen := contact.LastInboundAt != nil && time.Since(*contact.LastInboundAt) < 24*time.Hour
-		if (sendErr != nil || !useDocHeader) && windowOpen && len(fileBytes) > 0 {
+		if windowOpen && len(fileBytes) > 0 && (!useDocHeader || !templateOK) {
 			req2 := OutgoingMessageRequest{
 				Account:       account,
 				Contact:       contact,
@@ -627,41 +635,125 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 				MediaFilename: filename,
 				Caption:       caption,
 			}
-			_, docErr := a.SendOutgoingMessage(ctx, req2, DefaultSendOptions())
-			if docErr != nil {
-				if sendErr != nil {
-					sendErr = fmt.Errorf("template: %v; document: %v", sendErr, docErr)
-				} else {
-					// Template ok but doc failed — still count as sent notification
-					a.Log.Warn("Daily report free-form document failed after template",
-						"recipient", r.Name, "error", docErr)
-				}
+			if _, err := a.SendOutgoingMessage(ctx, req2, DefaultSendOptions()); err != nil {
+				lastErr = err
+				a.Log.Warn("Daily report free-form document failed", "recipient", r.Name, "error", err)
 			} else {
-				sendErr = nil // document delivered
+				docOK = true
 			}
 		}
 		cancel()
 
-		if sendErr != nil {
-			msg := fmt.Sprintf("%s (%s): %v", r.Name, phone, sendErr)
-			if strings.Contains(strings.ToLower(sendErr.Error()), "24") || strings.Contains(sendErr.Error(), "131047") {
-				msg += " [outside 24h window — template must be APPROVED utility; file is still in History download]"
-			}
-			errs = append(errs, msg)
-			a.Log.Error("Daily report send failed", "recipient", r.Name, "phone", phone, "error", sendErr)
+		if templateOK || docOK {
+			sent++
 			continue
 		}
-		// Count as sent if template succeeded (even if free-form doc skipped).
-		if template != nil || windowOpen {
-			sent++
-		} else {
-			errs = append(errs, fmt.Sprintf("%s (%s): no template and outside 24h — file saved in History only", r.Name, phone))
+		if template == nil && !windowOpen {
+			errs = append(errs, fmt.Sprintf("%s (%s): no usable template and outside 24h window — file saved in History only", r.Name, phone))
+			continue
+		}
+		if lastErr != nil {
+			msg := fmt.Sprintf("%s (%s): %v", r.Name, phone, lastErr)
+			if strings.Contains(strings.ToLower(lastErr.Error()), "24") || strings.Contains(lastErr.Error(), "131047") {
+				msg += " [outside 24h — pick an APPROVED template on Daily Reports; DOCX is still in History]"
+			}
+			errs = append(errs, msg)
+			a.Log.Error("Daily report send failed", "recipient", r.Name, "phone", phone, "error", lastErr)
 		}
 	}
 	if active == 0 {
 		errs = append(errs, "no active recipients configured")
 	}
 	return sent, errs
+}
+
+// loadDailyReportTemplate resolves the dropdown-selected template for this WA account.
+// Prefers exact account+name+language, then account+name, then name only (language match preferred in Go).
+func (a *App) loadDailyReportTemplate(settings *models.DailyReportSettings, accountName string) (*models.Template, []string) {
+	tplName := strings.TrimSpace(settings.ReportTemplateName)
+	if tplName == "" {
+		return nil, []string{"no template selected — choose an APPROVED template on Daily Reports setup"}
+	}
+	tplLang := strings.TrimSpace(settings.ReportTemplateLanguage)
+	if tplLang == "" {
+		tplLang = "en"
+	}
+
+	pick := func(rows []models.Template) *models.Template {
+		if len(rows) == 0 {
+			return nil
+		}
+		for i := range rows {
+			if strings.EqualFold(rows[i].Language, tplLang) {
+				return &rows[i]
+			}
+		}
+		return &rows[0]
+	}
+
+	var rows []models.Template
+	// 1) exact account + name + language
+	if err := a.DB.Where("organization_id = ? AND name = ? AND whats_app_account = ? AND language = ?",
+		settings.OrganizationID, tplName, accountName, tplLang).Limit(1).Find(&rows).Error; err == nil {
+		if t := pick(rows); t != nil {
+			if !strings.EqualFold(t.Status, "APPROVED") {
+				return nil, []string{fmt.Sprintf("template %q status is %s (need APPROVED)", tplName, t.Status)}
+			}
+			return t, nil
+		}
+	}
+	// 2) account + name (any language)
+	rows = nil
+	if err := a.DB.Where("organization_id = ? AND name = ? AND whats_app_account = ?",
+		settings.OrganizationID, tplName, accountName).Find(&rows).Error; err == nil {
+		if t := pick(rows); t != nil {
+			if !strings.EqualFold(t.Status, "APPROVED") {
+				return nil, []string{fmt.Sprintf("template %q status is %s (need APPROVED)", tplName, t.Status)}
+			}
+			return t, nil
+		}
+	}
+	// 3) name only (any account)
+	rows = nil
+	if err := a.DB.Where("organization_id = ? AND name = ?", settings.OrganizationID, tplName).Find(&rows).Error; err != nil || len(rows) == 0 {
+		return nil, []string{fmt.Sprintf("template %q not found — sync Templates and select it again on Daily Reports", tplName)}
+	}
+	t := pick(rows)
+	if t == nil {
+		return nil, []string{fmt.Sprintf("template %q not found — sync Templates and select it again on Daily Reports", tplName)}
+	}
+	if !strings.EqualFold(t.Status, "APPROVED") {
+		return nil, []string{fmt.Sprintf("template %q status is %s (need APPROVED)", tplName, t.Status)}
+	}
+	return t, nil
+}
+
+// buildDailyReportTemplateParams maps date/count/type onto the template's declared body/header variables only.
+// Order for positional {{1}},{{2}},{{3}}: date, chat count, report type.
+func buildDailyReportTemplateParams(content, date string, chatCount int, reportType string) map[string]string {
+	out := map[string]string{}
+	names := templateutil.ExtParamNames(content)
+	if len(names) == 0 {
+		return out
+	}
+	ordered := []string{date, fmt.Sprintf("%d", chatCount), reportType}
+	for i, name := range names {
+		key := strings.ToLower(strings.TrimSpace(name))
+		switch key {
+		case "date", "report_date", "day":
+			out[name] = date
+		case "count", "chat_count", "chats", "total":
+			out[name] = fmt.Sprintf("%d", chatCount)
+		case "type", "report_type", "label", "title":
+			out[name] = reportType
+		default:
+			// positional {{1}} {{2}} {{3}} or unknown named → fill by occurrence order
+			if i < len(ordered) {
+				out[name] = ordered[i]
+			}
+		}
+	}
+	return out
 }
 
 func (a *App) getOrCreateDailyReportSettings(orgID uuid.UUID) (*models.DailyReportSettings, error) {

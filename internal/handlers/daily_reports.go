@@ -28,11 +28,11 @@ type DailyReportSettingsResponse struct {
 	NextRunPreview  string                    `json:"next_run_preview,omitempty"`
 	MaxRecipients   int                       `json:"max_recipients"`
 
-	// WhatsApp utility template (DOCUMENT header) for cold sends outside 24h window
+	// WhatsApp template for cold notify outside 24h (prefer TEXT header utility)
 	ReportTemplateName     string `json:"report_template_name"`
 	ReportTemplateLanguage string `json:"report_template_language"`
 	TemplateConfigured     bool   `json:"template_configured"`
-	DeliveryMode           string `json:"delivery_mode"` // template | freeform | none
+	DeliveryMode           string `json:"delivery_mode"` // template | freeform
 
 	// Schedule status for UI (persistent + computed)
 	ScheduleActive          bool    `json:"schedule_active"`
@@ -257,7 +257,8 @@ func (a *App) UpdateDailyReportSettings(r *fastglue.Request) error {
 		tx.Rollback()
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save settings", nil, "")
 	}
-	if err := tx.Where("settings_id = ?", s.ID).Delete(&models.DailyReportRecipient{}).Error; err != nil {
+	// Hard-delete so soft-deleted rows do not accumulate on every save.
+	if err := tx.Unscoped().Where("settings_id = ?", s.ID).Delete(&models.DailyReportRecipient{}).Error; err != nil {
 		tx.Rollback()
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update recipients", nil, "")
 	}
@@ -531,11 +532,10 @@ func (a *App) toDailySettingsResponse(s *models.DailyReportSettings, recipients 
 	if tplLang == "" {
 		tplLang = "en"
 	}
-	deliveryMode := "none"
+	// template = cold notify via selected APPROVED template; freeform = DOCX only if 24h open
+	deliveryMode := "freeform"
 	if tplName != "" {
 		deliveryMode = "template"
-	} else if s.WhatsAppAccount != "" || true {
-		deliveryMode = "freeform"
 	}
 
 	resp := DailyReportSettingsResponse{

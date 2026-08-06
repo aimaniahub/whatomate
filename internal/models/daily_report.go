@@ -13,7 +13,7 @@ const (
 	DailyReportStatusRunning   = "running"
 	DailyReportStatusCompleted = "completed"
 	DailyReportStatusFailed    = "failed"
-	DailyReportStatusEmpty     = "empty" // completed with zero chats (still may send "no chats" PDF)
+	DailyReportStatusEmpty     = "empty" // completed with zero chats (still may send "no chats" DOCX)
 )
 
 // Daily report trigger sources.
@@ -54,9 +54,9 @@ type DailyReportSettings struct {
 	SendTime        string    `gorm:"size:8;default:'20:00'" json:"send_time"` // HH:MM local (normalized)
 	ReportLanguage  string    `gorm:"size:10;default:'en'" json:"report_language"`
 
-	// Utility template for sending outside the 24h WhatsApp session window.
-	// Must be APPROVED, category UTILITY, header type DOCUMENT.
-	// Body variables (recommended): {{1}}=report date, {{2}}=chat count, {{3}}=report type label.
+	// Selected WhatsApp template (dropdown on Daily Reports). Prefer APPROVED UTILITY
+	// with TEXT header for notify-outside-24h. DOCUMENT header optional for attach-in-header.
+	// Body vars by order: {{1}}=date, {{2}}=chat count, {{3}}=report type (if present).
 	ReportTemplateName     string `gorm:"size:255" json:"report_template_name"`
 	ReportTemplateLanguage string `gorm:"size:20;default:'en'" json:"report_template_language"`
 
@@ -92,7 +92,7 @@ func (DailyReportSettings) TableName() string {
 	return "daily_report_settings"
 }
 
-// DailyReportRecipient is a person who receives the PDF (max 2 per org).
+// DailyReportRecipient is a person who receives the report notify (max 2 per org).
 type DailyReportRecipient struct {
 	BaseModel
 	OrganizationID uuid.UUID `gorm:"type:uuid;index;not null" json:"organization_id"`

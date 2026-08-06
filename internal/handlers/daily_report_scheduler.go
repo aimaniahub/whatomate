@@ -99,19 +99,17 @@ func (p *DailyReportScheduler) processOrgSchedule(s *models.DailyReportSettings,
 		return
 	}
 
-	// Already finished today's report → do not re-fire (daily once).
-	if dailyreport.IsTerminalRunStatus(s.LastScheduledStatus) && s.LastScheduledDate == reportDate {
-		return
-	}
-
+	// Source of truth for "already ran today" is the run row (not only settings audit).
 	var existing models.DailyReportRun
 	err := p.app.DB.Where("organization_id = ? AND report_date = ?", s.OrganizationID, reportDate).
 		Order("created_at desc").
 		First(&existing).Error
 	if err == nil {
 		if dailyreport.IsTerminalRunStatus(existing.Status) {
-			// Sync settings audit if missing (manual run earlier today still counts as done for day).
-			p.persistScheduleAudit(s, &existing, reportDate)
+			// Keep settings audit aligned (manual or prior schedule).
+			if s.LastScheduledDate != reportDate || s.LastScheduledStatus != existing.Status {
+				p.persistScheduleAudit(s, &existing, reportDate)
+			}
 			return
 		}
 		if existing.Status == models.DailyReportStatusRunning {

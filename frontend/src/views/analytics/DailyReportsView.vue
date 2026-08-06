@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { PageHeader, ErrorState } from '@/components/shared'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -30,11 +30,24 @@ import { useAuthStore } from '@/stores/auth'
 import {
   accountsService,
   dailyReportsService,
+  templatesService,
   type DailyReportRecipient,
   type DailyReportRun,
   type DailyReportSettings
 } from '@/services/api'
 import { Download, Play, Plus, RefreshCw, Save, Trash2, Send } from 'lucide-vue-next'
+
+interface ReportTemplateOption {
+  id: string
+  name: string
+  display_name?: string
+  language: string
+  category?: string
+  status?: string
+  header_type?: string
+  body_content?: string
+  whatsapp_account?: string
+}
 
 const { t } = useI18n()
 const toast = useAppToast()
@@ -50,6 +63,8 @@ const error = ref<string | null>(null)
 const settings = ref<DailyReportSettings | null>(null)
 const runs = ref<DailyReportRun[]>([])
 const accounts = ref<{ name: string }[]>([])
+const templates = ref<ReportTemplateOption[]>([])
+const templatesLoading = ref(false)
 const runDate = ref('')
 
 const form = ref({
@@ -58,7 +73,7 @@ const form = ref({
   send_time: '20:00',
   whatsapp_account: '',
   recipients: [] as DailyReportRecipient[],
-  report_template_name: 'daily_chat_report',
+  report_template_name: '',
   report_template_language: 'en',
   ai_enabled: false,
   ai_provider: 'openrouter',
@@ -72,6 +87,94 @@ const form = ref({
 const defaultAIPrompt = ref('')
 
 const maxRecipients = computed(() => settings.value?.max_recipients ?? 2)
+
+/** Unique key for Select: name + language (same template can exist in multiple langs). */
+function templateKey(t: { name: string; language: string }) {
+  return `${t.name}||${t.language || 'en'}`
+}
+
+const selectedTemplateKey = computed({
+  get() {
+    if (!form.value.report_template_name) return '__none__'
+    return templateKey({
+      name: form.value.report_template_name,
+      language: form.value.report_template_language || 'en'
+    })
+  },
+  set(key: string) {
+    if (!key || key === '__none__') {
+      form.value.report_template_name = ''
+      form.value.report_template_language = 'en'
+      return
+    }
+    const [name, lang] = key.split('||')
+    form.value.report_template_name = name || ''
+    form.value.report_template_language = lang || 'en'
+  }
+})
+
+const selectedTemplate = computed(() =>
+  templates.value.find(
+    (t) =>
+      t.name === form.value.report_template_name &&
+      (t.language || 'en') === (form.value.report_template_language || 'en')
+  )
+)
+
+async function loadTemplates(accountName: string) {
+  templatesLoading.value = true
+  try {
+    const params: { status: string; account?: string; limit: number; page: number } = {
+      status: 'APPROVED',
+      limit: 100,
+      page: 1
+    }
+    if (accountName) {
+      params.account = accountName
+    }
+    const res = await templatesService.list(params)
+    const data = res.data?.data ?? res.data
+    const list = data?.templates || []
+    const mapped: ReportTemplateOption[] = (Array.isArray(list) ? list : []).map((t: any) => ({
+      id: t.id,
+      name: t.name,
+      display_name: t.display_name,
+      language: t.language || 'en',
+      category: t.category,
+      status: t.status,
+      header_type: t.header_type,
+      body_content: t.body_content,
+      whatsapp_account: t.whatsapp_account
+    }))
+    // Keep currently saved selection visible even if API list is filtered.
+    const savedName = form.value.report_template_name
+    const savedLang = form.value.report_template_language || 'en'
+    if (
+      savedName &&
+      !mapped.some((t) => t.name === savedName && (t.language || 'en') === savedLang)
+    ) {
+      mapped.unshift({
+        id: 'saved',
+        name: savedName,
+        display_name: savedName,
+        language: savedLang,
+        status: 'SAVED'
+      })
+    }
+    templates.value = mapped
+  } catch {
+    templates.value = []
+  } finally {
+    templatesLoading.value = false
+  }
+}
+
+watch(
+  () => form.value.whatsapp_account,
+  (acct) => {
+    loadTemplates(acct || '')
+  }
+)
 
 async function load() {
   loading.value = true
@@ -97,7 +200,7 @@ async function load() {
         is_active: r.is_active !== false,
         sort_order: r.sort_order
       })),
-      report_template_name: s.report_template_name || 'daily_chat_report',
+      report_template_name: s.report_template_name || '',
       report_template_language: s.report_template_language || 'en',
       ai_enabled: !!s.ai_enabled,
       ai_provider: s.ai_provider || 'openrouter',
@@ -115,6 +218,8 @@ async function load() {
     accounts.value = Array.isArray(list)
       ? list.map((a: any) => ({ name: a.name || a.Name || '' })).filter((a: any) => a.name)
       : []
+
+    await loadTemplates(form.value.whatsapp_account || '')
   } catch (e: any) {
     error.value = e?.response?.data?.message || e?.message || 'Failed to load daily reports'
   } finally {
@@ -235,14 +340,14 @@ async function resend(id: string) {
   if (!canWrite.value) return
   try {
     await dailyReportsService.resend(id)
-    toast.success('Resent', 'PDF send attempted again')
+    toast.success('Resent', 'Template / document send attempted again')
     await load()
   } catch (e: any) {
     toast.error('Resend failed', e?.response?.data?.message || e?.message || 'Could not resend')
   }
 }
 
-async function download(id: string) {
+async function download(id: string, filename?: string) {
   try {
     const { api } = await import('@/services/api')
     const res = await api.get(`/analytics/daily-reports/runs/${id}/download`, {
@@ -254,11 +359,11 @@ async function download(id: string) {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `daily-report-${id}.docx`
+    a.download = filename || `daily-report-${id}.docx`
     a.click()
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    toast.error('Download failed', e?.message || 'Could not download PDF')
+    toast.error('Download failed', e?.message || 'Could not download DOCX')
   }
 }
 
@@ -285,7 +390,7 @@ onMounted(load)
   <div class="flex flex-col h-full min-h-0">
     <PageHeader
       :title="t('nav.dailyReports')"
-      description="AI end-of-day chat summaries as PDF, sent to admin/employee WhatsApp numbers"
+      description="AI end-of-day chat summaries as Word (.docx), notified via template + download in History"
     />
 
     <ScrollArea class="flex-1 min-h-0">
@@ -446,63 +551,75 @@ onMounted(load)
               </div>
             </div>
 
-            <!-- Utility TEXT template (outside 24h window) -->
+            <!-- Pick existing approved template (no need to type name) -->
             <div class="space-y-3 rounded-lg border p-4">
               <div class="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <h3 class="text-sm font-semibold">WhatsApp utility template (TEXT header)</h3>
+                  <h3 class="text-sm font-semibold">WhatsApp template</h3>
                   <p class="text-xs text-muted-foreground">
-                    Simple utility message so recipients get a WhatsApp ping outside the 24h window.
-                    Only the recipients below receive it. Full DOCX stays in History for download
-                    (free-form file send only works if that number already messaged you within 24h).
+                    Choose an existing <strong>APPROVED</strong> template for this WhatsApp account.
+                    Used to notify report recipients outside the 24h window. Full DOCX stays in History.
                   </p>
                 </div>
-                <Badge :variant="settings?.template_configured ? 'default' : 'secondary'">
-                  {{ settings?.template_configured ? 'Template set' : 'Not configured' }}
+                <Badge :variant="form.report_template_name ? 'default' : 'secondary'">
+                  {{ form.report_template_name ? 'Selected' : 'Not selected' }}
                 </Badge>
               </div>
-              <div class="grid gap-4 sm:grid-cols-2">
-                <div class="space-y-2">
-                  <Label>Template name</Label>
-                  <Input
-                    v-model="form.report_template_name"
-                    :disabled="!canWrite"
-                    placeholder="daily_chat_report"
-                  />
-                </div>
-                <div class="space-y-2">
-                  <Label>Language code</Label>
-                  <Input
-                    v-model="form.report_template_language"
-                    :disabled="!canWrite"
-                    placeholder="en"
-                  />
-                </div>
+              <div class="space-y-2">
+                <Label>Template</Label>
+                <Select
+                  :model-value="selectedTemplateKey"
+                  :disabled="!canWrite || templatesLoading"
+                  @update:model-value="(v: string) => (selectedTemplateKey = v || '__none__')"
+                >
+                  <SelectTrigger>
+                    <SelectValue
+                      :placeholder="
+                        templatesLoading
+                          ? 'Loading templates…'
+                          : templates.length
+                            ? 'Select approved template'
+                            : 'No approved templates — sync Templates first'
+                      "
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">None — don’t send template</SelectItem>
+                    <SelectItem
+                      v-for="t in templates"
+                      :key="templateKey(t)"
+                      :value="templateKey(t)"
+                    >
+                      {{
+                        `${t.display_name || t.name} (${t.language}${t.category ? ' · ' + t.category : ''}${t.header_type ? ' · ' + t.header_type : ''})`
+                      }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p v-if="form.report_template_name" class="text-xs text-muted-foreground">
+                  Saved as <code>{{ form.report_template_name }}</code>
+                  · lang <code>{{ form.report_template_language }}</code>
+                  <span v-if="selectedTemplate?.header_type">
+                    · header <code>{{ selectedTemplate.header_type || 'TEXT' }}</code>
+                  </span>
+                </p>
+                <p v-if="!templatesLoading && !templates.length" class="text-xs text-amber-600 dark:text-amber-400">
+                  No APPROVED templates for this account. Go to Templates, sync from Meta, then refresh.
+                </p>
               </div>
-              <div class="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground space-y-1">
-                <p class="font-medium text-foreground">Meta Business Manager → create template with these exact fields:</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li><strong>Category:</strong> Utility</li>
-                  <li><strong>Name:</strong> <code>daily_chat_report</code> (must match field above)</li>
-                  <li><strong>Language:</strong> English (code <code>en</code> — match Language field)</li>
-                  <li><strong>Header type:</strong> Text</li>
-                  <li><strong>Header text:</strong> <code>Daily Chat Report</code> (static text, no &#123;&#123;vars&#125;&#125;)</li>
-                  <li>
-                    <strong>Body text (copy exactly):</strong><br />
-                    <code class="block mt-1 whitespace-pre-wrap">Here is your report for {{1}}.
-Total chats: {{2}}.
-{{3}}
-Open Whatomate → Analytics → Daily Reports to download the full Word file.</code>
-                  </li>
-                  <li>Sample values for review: <code>2026-07-31</code> / <code>5</code> / <code>Daily chat report</code></li>
-                  <li>Submit → wait <strong>APPROVED</strong> → Whatomate Templates → Sync</li>
-                </ul>
-                <p class="font-medium text-foreground mt-2">Whatomate fills body variables as:</p>
-                <ul class="list-disc pl-4 space-y-1">
-                  <li><code>{{1}}</code> → report date (YYYY-MM-DD)</li>
-                  <li><code>{{2}}</code> → chat count (0 if none)</li>
-                  <li><code>{{3}}</code> → type label: Daily chat report / Daily chat report (no chats)</li>
-                </ul>
+              <div
+                v-if="selectedTemplate?.body_content"
+                class="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground"
+              >
+                <p class="font-medium text-foreground mb-1">Template body preview</p>
+                <pre class="whitespace-pre-wrap font-sans">{{ selectedTemplate.body_content }}</pre>
+                <p class="mt-2">
+                  When sending, the app fills body variables:
+                  <strong>1</strong> = report date,
+                  <strong>2</strong> = chat count,
+                  <strong>3</strong> = report type label.
+                  Prefer a template with 1–3 body variables matching that order.
+                </p>
               </div>
             </div>
 
@@ -702,7 +819,7 @@ Open Whatomate → Analytics → Daily Reports to download the full Word file.</
       <Card>
         <CardHeader>
           <CardTitle>History</CardTitle>
-          <CardDescription>Past generated reports (download PDF or resend)</CardDescription>
+          <CardDescription>Past generated reports (download Word DOCX or resend WhatsApp notify)</CardDescription>
         </CardHeader>
         <CardContent>
           <div v-if="loading" class="space-y-2">
@@ -751,7 +868,7 @@ Open Whatomate → Analytics → Daily Reports to download the full Word file.</
                     v-if="run.has_pdf"
                     variant="outline"
                     size="sm"
-                    @click="download(run.id)"
+                    @click="download(run.id, run.pdf_filename)"
                   >
                     <Download class="h-3.5 w-3.5" />
                   </Button>
