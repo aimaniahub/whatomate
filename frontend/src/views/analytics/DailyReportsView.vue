@@ -446,14 +446,15 @@ onMounted(load)
               </div>
             </div>
 
-            <!-- Utility template (required for send outside 24h window) -->
+            <!-- Utility TEXT template (outside 24h window) -->
             <div class="space-y-3 rounded-lg border p-4">
               <div class="flex flex-wrap items-center justify-between gap-2">
                 <div>
-                  <h3 class="text-sm font-semibold">WhatsApp utility template (DOCUMENT)</h3>
+                  <h3 class="text-sm font-semibold">WhatsApp utility template (TEXT header)</h3>
                   <p class="text-xs text-muted-foreground">
-                    Required so admins receive the report outside the 24-hour session window. Only the
-                    recipients listed below get the message.
+                    Simple utility message so recipients get a WhatsApp ping outside the 24h window.
+                    Only the recipients below receive it. Full DOCX stays in History for download
+                    (free-form file send only works if that number already messaged you within 24h).
                   </p>
                 </div>
                 <Badge :variant="settings?.template_configured ? 'default' : 'secondary'">
@@ -479,22 +480,29 @@ onMounted(load)
                 </div>
               </div>
               <div class="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground space-y-1">
-                <p class="font-medium text-foreground">Create this in Meta Business Manager → Message templates:</p>
+                <p class="font-medium text-foreground">Meta Business Manager → create template with these exact fields:</p>
                 <ul class="list-disc pl-4 space-y-1">
-                  <li>Category: <strong>UTILITY</strong></li>
-                  <li>Name: e.g. <code>daily_chat_report</code> (must match field above)</li>
-                  <li>Header: <strong>Document</strong></li>
+                  <li><strong>Category:</strong> Utility</li>
+                  <li><strong>Name:</strong> <code>daily_chat_report</code> (must match field above)</li>
+                  <li><strong>Language:</strong> English (code <code>en</code> — match Language field)</li>
+                  <li><strong>Header type:</strong> Text</li>
+                  <li><strong>Header text:</strong> <code>Daily Chat Report</code> (static text, no &#123;&#123;vars&#125;&#125;)</li>
                   <li>
-                    Body example:
-                    <code>Here is your {{3}} for {{1}}. Chats today: {{2}}.</code>
+                    <strong>Body text (copy exactly):</strong><br />
+                    <code class="block mt-1 whitespace-pre-wrap">Here is your report for {{1}}.
+Total chats: {{2}}.
+{{3}}
+Open Whatomate → Analytics → Daily Reports to download the full Word file.</code>
                   </li>
-                  <li>Variables: <code>1</code>=date, <code>2</code>=chat count, <code>3</code>=report type</li>
-                  <li>Submit → wait for <strong>APPROVED</strong> → Sync templates in Whatomate</li>
+                  <li>Sample values for review: <code>2026-07-31</code> / <code>5</code> / <code>Daily chat report</code></li>
+                  <li>Submit → wait <strong>APPROVED</strong> → Whatomate Templates → Sync</li>
                 </ul>
-                <p>
-                  After approval, Save setup here, then Run now. The DOCX is attached as the template
-                  document header and sent only to configured recipients.
-                </p>
+                <p class="font-medium text-foreground mt-2">Whatomate fills body variables as:</p>
+                <ul class="list-disc pl-4 space-y-1">
+                  <li><code>{{1}}</code> → report date (YYYY-MM-DD)</li>
+                  <li><code>{{2}}</code> → chat count (0 if none)</li>
+                  <li><code>{{3}}</code> → type label: Daily chat report / Daily chat report (no chats)</li>
+                </ul>
               </div>
             </div>
 

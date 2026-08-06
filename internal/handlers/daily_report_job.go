@@ -485,7 +485,8 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 		return 0, []string{err.Error()}
 	}
 
-	// Prefer approved UTILITY template with DOCUMENT header (works outside 24h window).
+	// Prefer approved UTILITY template with TEXT (or empty) header — works outside 24h.
+	// Free-form DOCX is attempted only if the recipient already has an open 24h session.
 	tplName := strings.TrimSpace(settings.ReportTemplateName)
 	tplLang := strings.TrimSpace(settings.ReportTemplateLanguage)
 	if tplLang == "" {
@@ -498,12 +499,11 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 		q := a.DB.Where("organization_id = ? AND name = ? AND whats_app_account = ?",
 			settings.OrganizationID, tplName, account.Name)
 		if err := q.First(&t).Error; err != nil {
-			// Fall back: any language match / without account
 			err2 := a.DB.Where("organization_id = ? AND name = ?", settings.OrganizationID, tplName).
 				Order(fmt.Sprintf("CASE WHEN language = '%s' THEN 0 ELSE 1 END", strings.ReplaceAll(tplLang, "'", ""))).
 				First(&t).Error
 			if err2 != nil {
-				errs = append(errs, fmt.Sprintf("template %q not found for account %s — create & sync an APPROVED utility DOCUMENT template", tplName, account.Name))
+				errs = append(errs, fmt.Sprintf("template %q not found for account %s — create & sync an APPROVED utility TEXT template", tplName, account.Name))
 			} else {
 				template = &t
 			}
@@ -514,9 +514,13 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 			errs = append(errs, fmt.Sprintf("template %q status is %s (need APPROVED)", tplName, template.Status))
 			template = nil
 		}
-		if template != nil && !strings.EqualFold(template.HeaderType, "DOCUMENT") {
-			errs = append(errs, fmt.Sprintf("template %q header is %q (need DOCUMENT)", tplName, template.HeaderType))
-			template = nil
+		// Accept TEXT or empty/none header. DOCUMENT is still supported if user prefers attach-in-header.
+		if template != nil {
+			ht := strings.ToUpper(strings.TrimSpace(template.HeaderType))
+			if ht != "" && ht != "TEXT" && ht != "NONE" && ht != "DOCUMENT" {
+				errs = append(errs, fmt.Sprintf("template %q header is %q (use TEXT or DOCUMENT)", tplName, template.HeaderType))
+				template = nil
+			}
 		}
 	} else {
 		errs = append(errs, "no report template configured — free-form document only works inside WhatsApp 24h window")
@@ -527,16 +531,18 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 		mime = "application/pdf"
 	}
 
-	// Upload media once for template header (reused for all recipients).
+	// DOCUMENT header only: upload media once for template attachment.
 	var headerMediaID string
-	if template != nil && len(fileBytes) > 0 {
+	useDocHeader := template != nil && strings.EqualFold(template.HeaderType, "DOCUMENT")
+	if useDocHeader && len(fileBytes) > 0 {
 		waAcct := a.toWhatsAppAccount(account)
 		ctxUp, cancelUp := context.WithTimeout(context.Background(), 60*time.Second)
 		id, upErr := a.WhatsApp.UploadMedia(ctxUp, waAcct, fileBytes, mime, filename)
 		cancelUp()
 		if upErr != nil {
 			errs = append(errs, "upload report media: "+upErr.Error())
-			template = nil // fall back to free-form attempt
+			template = nil
+			useDocHeader = false
 		} else {
 			headerMediaID = id
 		}
@@ -546,15 +552,16 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 	if data.EmptyDay || data.Overview.TotalChats == 0 {
 		reportType = "Daily chat report (no chats)"
 	}
+	// Body positional params (match Meta body {{1}} {{2}} {{3}}).
+	// Header TEXT may use its own {{1}} — filled via HeaderParams below.
 	bodyParams := map[string]string{
 		"1": run.ReportDate,
 		"2": fmt.Sprintf("%d", data.Overview.TotalChats),
 		"3": reportType,
 	}
-	// Also support named-style keys some templates use
-	bodyParams["date"] = bodyParams["1"]
-	bodyParams["chat_count"] = bodyParams["2"]
-	bodyParams["report_type"] = bodyParams["3"]
+	headerParams := map[string]string{
+		"1": reportType, // if header is e.g. "{{1}}" or "Report: {{1}}"
+	}
 
 	caption := fmt.Sprintf("%s — %s (%d chats)", reportType, run.ReportDate, data.Overview.TotalChats)
 
@@ -585,37 +592,33 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 
 		var sendErr error
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		if template != nil && headerMediaID != "" {
-			// Cold-send path: utility template + DOCUMENT header (outside 24h OK).
+
+		// 1) Utility template (TEXT header recommended) — works outside 24h.
+		if template != nil {
 			req := OutgoingMessageRequest{
-				Account:             account,
-				Contact:             contact,
-				Type:                models.MessageTypeTemplate,
-				Template:            template,
-				BodyParams:          bodyParams,
-				HeaderMediaID:       headerMediaID,
-				HeaderMediaFilename: filename,
-				MediaMimeType:       mime,
+				Account:      account,
+				Contact:      contact,
+				Type:         models.MessageTypeTemplate,
+				Template:     template,
+				BodyParams:   bodyParams,
+				HeaderParams: headerParams,
+			}
+			if useDocHeader && headerMediaID != "" {
+				req.HeaderMediaID = headerMediaID
+				req.HeaderMediaFilename = filename
+				req.MediaMimeType = mime
 			}
 			_, sendErr = a.SendOutgoingMessage(ctx, req, DefaultSendOptions())
 			if sendErr != nil {
-				a.Log.Warn("Daily report template send failed; trying free-form document",
-					"recipient", r.Name, "error", sendErr)
-				// Fall through to free-form for this recipient
-				req2 := OutgoingMessageRequest{
-					Account:       account,
-					Contact:       contact,
-					Type:          models.MessageTypeDocument,
-					MediaData:     fileBytes,
-					MediaMimeType: mime,
-					MediaFilename: filename,
-					Caption:       caption,
-				}
-				_, sendErr = a.SendOutgoingMessage(ctx, req2, DefaultSendOptions())
+				a.Log.Warn("Daily report template send failed", "recipient", r.Name, "error", sendErr)
 			}
-		} else {
-			// Free-form document — only works if recipient messaged within 24h.
-			req := OutgoingMessageRequest{
+		}
+
+		// 2) Free-form DOCX only if session window is already open (customer messaged us within 24h).
+		// Sending a template does NOT open free-form outbound; only customer inbound does.
+		windowOpen := contact.LastInboundAt != nil && time.Since(*contact.LastInboundAt) < 24*time.Hour
+		if (sendErr != nil || !useDocHeader) && windowOpen && len(fileBytes) > 0 {
+			req2 := OutgoingMessageRequest{
 				Account:       account,
 				Contact:       contact,
 				Type:          models.MessageTypeDocument,
@@ -624,20 +627,36 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 				MediaFilename: filename,
 				Caption:       caption,
 			}
-			_, sendErr = a.SendOutgoingMessage(ctx, req, DefaultSendOptions())
+			_, docErr := a.SendOutgoingMessage(ctx, req2, DefaultSendOptions())
+			if docErr != nil {
+				if sendErr != nil {
+					sendErr = fmt.Errorf("template: %v; document: %v", sendErr, docErr)
+				} else {
+					// Template ok but doc failed — still count as sent notification
+					a.Log.Warn("Daily report free-form document failed after template",
+						"recipient", r.Name, "error", docErr)
+				}
+			} else {
+				sendErr = nil // document delivered
+			}
 		}
 		cancel()
 
 		if sendErr != nil {
 			msg := fmt.Sprintf("%s (%s): %v", r.Name, phone, sendErr)
 			if strings.Contains(strings.ToLower(sendErr.Error()), "24") || strings.Contains(sendErr.Error(), "131047") {
-				msg += " [outside WhatsApp 24h window — configure APPROVED utility DOCUMENT template on Daily Reports setup]"
+				msg += " [outside 24h window — template must be APPROVED utility; file is still in History download]"
 			}
 			errs = append(errs, msg)
 			a.Log.Error("Daily report send failed", "recipient", r.Name, "phone", phone, "error", sendErr)
 			continue
 		}
-		sent++
+		// Count as sent if template succeeded (even if free-form doc skipped).
+		if template != nil || windowOpen {
+			sent++
+		} else {
+			errs = append(errs, fmt.Sprintf("%s (%s): no template and outside 24h — file saved in History only", r.Name, phone))
+		}
 	}
 	if active == 0 {
 		errs = append(errs, "no active recipients configured")

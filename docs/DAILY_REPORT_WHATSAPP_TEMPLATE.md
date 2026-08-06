@@ -1,104 +1,99 @@
-# Daily Report — WhatsApp Utility Template Setup
+# Daily Report — Simple Utility TEXT Template
 
-Daily reports are sent only to the **recipients** configured on **Analytics → Daily Reports**.
+## Important (24h window)
 
-Meta blocks free-form documents outside the **24-hour** customer care window. Production delivery uses an **approved UTILITY template with a DOCUMENT header**.
+| What | Opens free-form session? |
+|------|---------------------------|
+| Customer messages **you** | Yes (24h window) |
+| You send a **template** | Does **not** open free-form for more messages |
+| You send free-form document | Only if window already open |
+
+So:
+
+1. **Utility TEXT template** → always notifies admins (even if they never messaged today).  
+2. **DOCX file** → always saved in **Daily Reports → History** (download).  
+3. Free-form DOCX on WhatsApp → only if that admin already messaged the business within 24h.
 
 ---
 
-## 1. Create the template in Meta
+## Create in Meta Business Manager
 
-1. Open [Meta Business Suite](https://business.facebook.com/) → **WhatsApp Manager** → **Message templates**.
-2. **Create template**.
-3. Fill:
+**WhatsApp Manager → Message templates → Create**
 
-| Field | Value |
-|--------|--------|
-| **Name** | `daily_chat_report` (must match Whatomate field) |
+| Field | Exact value |
+|--------|-------------|
 | **Category** | **Utility** |
-| **Language** | e.g. English (`en` or `en_US` — match Whatomate language field) |
-| **Header** | **Document** |
-| **Body** | See sample below |
-| **Footer** | Optional (e.g. `Whatomate`) |
+| **Name** | `daily_chat_report` |
+| **Language** | English → language code **`en`** (or match Whatomate) |
+| **Header** | **Text** |
+| **Header content** | `Daily Chat Report` |
+| | *(static — do **not** put `{{1}}` in the header unless you know Meta named/positional rules)* |
+| **Body** | See below |
+| **Footer** | optional, e.g. `Whatomate` |
+| **Buttons** | none |
 
-### Recommended body text
-
-```text
-Here is your {{3}} for {{1}}.
-Chats today: {{2}}.
-Please open the attached document for the full summary.
-```
-
-| Variable | Whatomate fills |
-|----------|-----------------|
-| `{{1}}` | Report date (`YYYY-MM-DD`) |
-| `{{2}}` | Chat count (number, `0` for no-chat days) |
-| `{{3}}` | Report type label (`Daily chat report` or `Daily chat report (no chats)`) |
-
-4. Submit for review and wait until status is **APPROVED**.
-
----
-
-## 2. Sync template into Whatomate
-
-1. In Whatomate: **Templates** → sync from Meta for the same WhatsApp account you use for reports.
-2. Confirm the template shows:
-   - Status: **APPROVED**
-   - Header type: **DOCUMENT**
-   - Name matches exactly (e.g. `daily_chat_report`)
-
----
-
-## 3. Configure Daily Reports page
-
-**Analytics → Daily Reports → Setup**
-
-1. **WhatsApp account** — same account that owns the template (also used as chat source).
-2. **Template name** — `daily_chat_report`
-3. **Language** — same as Meta (e.g. `en`)
-4. **Recipients** — max 2 (admin / employee) with full WhatsApp numbers
-5. **Enable daily schedule** + time + timezone if needed
-6. **AI settings** — enable + API key for summaries
-7. **Save setup**
-
----
-
-## 4. What happens on send
+### Body (copy this)
 
 ```text
-Generate DOCX
-  → Upload DOCX to Meta media
-  → For each active recipient only:
-       Send UTILITY template with DOCUMENT header = report file
-       Body params: date, chat_count, report_type
-  → If template missing/fails: try free-form document (24h window only)
-  → Always keep file downloadable in History
+Here is your report for {{1}}.
+Total chats: {{2}}.
+{{3}}
+Open Whatomate → Analytics → Daily Reports to download the full Word file.
 ```
 
-- **With chats:** full table report + `{{3}}` = “Daily chat report”  
-- **No chats:** still generates DOCX (“No chats today”) and still sends via template (`{{2}}` = `0`)
+### Sample values (for Meta review)
+
+| Variable | Sample |
+|----------|--------|
+| `{{1}}` | `2026-07-31` |
+| `{{2}}` | `5` |
+| `{{3}}` | `Daily chat report` |
+
+### What Whatomate sends (matches code)
+
+| Body var | Filled by app |
+|----------|----------------|
+| `{{1}}` | Report date `YYYY-MM-DD` |
+| `{{2}}` | Chat count (`0` on no-chat days) |
+| `{{3}}` | `Daily chat report` or `Daily chat report (no chats)` |
 
 ---
 
-## 5. Checklist if send fails
+## Whatomate setup
 
-| Check | |
-|--------|--|
-| Template **APPROVED** | |
-| Header is **DOCUMENT** (not TEXT) | |
-| Template **name** matches Daily Reports field | |
-| Template synced under the **same WhatsApp account** | |
-| Recipients are **active** with correct country code | |
-| Run history **send_errors** column | |
-
-Common Meta issues:
-
-- Outside 24h + no template → free-form fails  
-- DOCUMENT header without filename → Meta error 132012  
-- Wrong language code → template not found  
+1. **Templates** → Sync for the same WhatsApp account as Daily Reports.  
+2. Confirm template **APPROVED**, name `daily_chat_report`.  
+3. **Analytics → Daily Reports**:
+   - WhatsApp account  
+   - Template name: `daily_chat_report`  
+   - Language: `en`  
+   - Recipients (max 2)  
+   - Save  
 
 ---
 
-## 6. Security note
+## Optional: header with one variable
 
-Only numbers listed under **Recipients** receive the report. Customers are never bulk-messaged by this job.
+If you prefer a dynamic header:
+
+| Header text | Whatomate fills |
+|-------------|-----------------|
+| `{{1}}` | Report type (`Daily chat report` / `… (no chats)`) |
+
+Meta allows **at most one** variable in a TEXT header.  
+Body vars stay `{{1}}` date, `{{2}}` count, `{{3}}` type (header and body variables are separate components).
+
+Recommended: keep header **static** `Daily Chat Report` for simplicity.
+
+---
+
+## Flow in code
+
+```text
+For each active recipient on the report page only:
+  1. Send APPROVED utility TEXT template (cold OK)
+  2. If recipient last_inbound < 24h → also try free-form DOCX
+  3. Always keep DOCX in History for download
+```
+
+No-chat days still send the template (`{{2}}` = `0`, `{{3}}` = no-chats label).
