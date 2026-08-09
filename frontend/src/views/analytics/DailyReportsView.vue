@@ -306,15 +306,15 @@ async function runNow() {
   if (!canWrite.value) return
   running.value = true
   try {
-    // Wait for full AI → PDF → send pipeline before notifying the user.
+    // Blocks until: collect → AI complete → DOCX compose → WhatsApp send (server-side sync).
     const res = await dailyReportsService.runNow({
       date: runDate.value || undefined
     })
     const run = (res.data?.data ?? res.data) as DailyReportRun
     const chats = typeof run?.chat_count === 'number' ? `${run.chat_count} chats` : 'done'
     toast.success(
-      'Report created',
-      `${chats} · sent ${run?.sent_count ?? 0}. Download DOCX from history.`
+      'Report ready',
+      `${chats} · AI done · sent ${run?.sent_count ?? 0} on WhatsApp. Download DOCX from history.`
     )
     if (run?.send_errors) {
       toast.warning('Send issues', run.send_errors)
@@ -795,8 +795,8 @@ onMounted(load)
         <CardHeader>
           <CardTitle>Run now</CardTitle>
           <CardDescription>
-            Uses AI settings on this page. Builds a Word (.docx) report from real chats for the selected day,
-            then sends it to recipients.
+            Full pipeline (waits until finished): collect chats → AI summary → Word (.docx) → WhatsApp notify.
+            Do not leave until it completes.
           </CardDescription>
         </CardHeader>
         <CardContent class="flex flex-wrap items-end gap-3">
@@ -806,8 +806,11 @@ onMounted(load)
           </div>
           <Button v-if="canWrite" :disabled="running" @click="runNow">
             <Play class="mr-2 h-4 w-4" />
-            {{ running ? 'Building report…' : 'Run now' }}
+            {{ running ? 'Waiting for AI + send…' : 'Run now' }}
           </Button>
+          <p v-if="running" class="text-xs text-muted-foreground w-full">
+            Collecting chats → AI summary (waits for all batches) → Word file → WhatsApp. Do not close this page.
+          </p>
           <Button variant="outline" :disabled="loading" @click="load">
             <RefreshCw class="mr-2 h-4 w-4" />
             Refresh

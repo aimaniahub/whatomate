@@ -24,13 +24,21 @@ const (
 	maxMessagesPerContact = 40
 	maxMsgChars           = 500
 	aiBatchSize           = 12 // chats per AI call
+	// dailyReportStuckAfter: AI batches can run long — do not reclaim while still working.
+	dailyReportStuckAfter = 45 * time.Minute
 )
 
-// RunDailyReport generates the DOCX for reportDate and sends it to active recipients.
-// With chats: tries page AI (or chatbot AI), then rule-based fallback so DOCX always has rows.
-// Empty days still produce a "no chats" DOCX and attempt template notify.
+// RunDailyReport runs the full production pipeline **synchronously**:
+//
+//  1. Collect chats/messages for the local calendar day
+//  2. Wait for AI summary to complete (all batches) — or rule-based fallback
+//  3. Ensure every row has summary + message excerpts
+//  4. Compose DOCX and save to disk
+//  5. Send WhatsApp (sync — wait for Meta) only after steps 1–4 succeed
+//
 // reportDate is YYYY-MM-DD in the settings timezone. Idempotent for schedule unless force.
 func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, force bool) (*models.DailyReportRun, error) {
+	pipelineStart := time.Now()
 	settings, err := a.getOrCreateDailyReportSettings(orgID)
 	if err != nil {
 		return nil, err
@@ -55,7 +63,7 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 			return &run, nil
 		}
 		if run.Status == models.DailyReportStatusRunning {
-			if !force && run.StartedAt != nil && time.Since(*run.StartedAt) < 30*time.Minute {
+			if !force && run.StartedAt != nil && time.Since(*run.StartedAt) < dailyReportStuckAfter {
 				return &run, fmt.Errorf("report already running for %s", reportDate)
 			}
 		}
@@ -86,13 +94,14 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	// Claim run as running. With force (manual), always overwrite.
 	// Without force, only claim if not terminal and not a fresh running job (race-safe).
 	now := time.Now()
-	staleBefore := now.Add(-30 * time.Minute)
+	staleBefore := now.Add(-dailyReportStuckAfter)
 	updates := map[string]any{
 		"status":        models.DailyReportStatusRunning,
 		"triggered_by":  triggeredBy,
 		"started_at":    now,
 		"error_message": "",
 		"send_errors":   "",
+		"sent_count":    0,
 	}
 	q := a.DB.Model(&models.DailyReportRun{}).Where("id = ?", run.ID)
 	if !force {
@@ -117,7 +126,6 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		if run.Status == models.DailyReportStatusRunning {
 			return &run, fmt.Errorf("report already running for %s", reportDate)
 		}
-		// Unexpected status — last-chance claim
 		if err := a.DB.Model(&run).Updates(updates).Error; err != nil {
 			return nil, err
 		}
@@ -132,6 +140,8 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		run.ErrorMessage = msg
 		run.FinishedAt = &finished
 		_ = a.DB.Save(&run).Error
+		a.Log.Error("Daily report pipeline failed",
+			"org", orgID, "date", reportDate, "error", msg, "elapsed", time.Since(pipelineStart))
 		return &run, fmt.Errorf("%s", msg)
 	}
 
@@ -141,14 +151,22 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		orgName = org.Name
 	}
 
-	a.Log.Info("Daily report: collecting chats", "org", orgID, "date", reportDate)
+	// ── Phase 1: COLLECT ──────────────────────────────────────────────
+	a.Log.Info("Daily report phase=collect start", "org", orgID, "date", reportDate, "trigger", triggeredBy)
 	chats, totalMsgs, collectErr := a.collectDailyChats(orgID, settings.WhatsAppAccount, reportDate, loc)
 	if collectErr != nil {
 		return fail("collect chats: " + collectErr.Error())
 	}
 	run.ChatCount = len(chats)
 	run.MessageCount = totalMsgs
+	_ = a.DB.Model(&run).Updates(map[string]any{
+		"chat_count":    run.ChatCount,
+		"message_count": run.MessageCount,
+	}).Error
+	a.Log.Info("Daily report phase=collect done",
+		"org", orgID, "chats", len(chats), "messages", totalMsgs, "elapsed", time.Since(pipelineStart))
 
+	// ── Phase 2: AI SUMMARY (wait until all batches finish) ───────────
 	genAt := time.Now().In(loc).Format("2006-01-02 15:04")
 	var reportData dailyreport.ReportData
 	var aiModel string
@@ -157,36 +175,66 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
 		reportData.GeneratedAt = genAt
 		aiModel = "none"
-		a.Log.Info("Daily report: empty day (no AI)", "org", orgID, "date", reportDate)
+		a.Log.Info("Daily report phase=ai skipped (empty day)", "org", orgID, "date", reportDate)
 	} else {
-		a.Log.Info("Daily report: starting AI summarize",
+		a.Log.Info("Daily report phase=ai start",
 			"org", orgID, "date", reportDate, "chats", len(chats), "messages", totalMsgs)
+		aiStart := time.Now()
 		var sumErr error
 		reportData, aiModel, sumErr = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
 		if sumErr != nil {
-			// Production: still ship a filled DOCX so ops get contact list + rule-based bullets.
-			a.Log.Error("Daily report AI failed; using rule-based summaries",
-				"org", orgID, "error", sumErr, "chats", len(chats))
+			// Still produce a usable report — never send before we have summaries.
+			a.Log.Error("Daily report phase=ai failed; using rule-based summaries",
+				"org", orgID, "error", sumErr, "chats", len(chats), "ai_elapsed", time.Since(aiStart))
 			reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
 			reportData.GeneratedAt = genAt
 			aiModel = "fallback"
 			run.ErrorMessage = "AI summarize failed (used rule-based summaries): " + sumErr.Error()
 		} else {
-			a.Log.Info("Daily report: AI summarize complete",
-				"org", orgID, "model", aiModel, "rows", len(reportData.Chats), "ai_used", reportData.AIUsed)
+			a.Log.Info("Daily report phase=ai done",
+				"org", orgID, "model", aiModel, "rows", len(reportData.Chats),
+				"ai_used", reportData.AIUsed, "ai_elapsed", time.Since(aiStart))
 		}
-		// Safety: never emit empty chat list when we collected contacts.
 		if len(reportData.Chats) == 0 && len(chats) > 0 {
 			reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
 			reportData.GeneratedAt = genAt
 			aiModel = "fallback"
 		}
+		// Fill any blank bullets from raw transcripts before compose.
+		reportData = dailyreport.EnsureFilledSummaries(reportData, chats)
 	}
 	run.AIModel = aiModel
 
+	filled := 0
+	for _, c := range reportData.Chats {
+		if strings.TrimSpace(c.Summary) != "" || len(c.Bullets) > 0 || len(c.Excerpts) > 0 {
+			filled++
+		}
+	}
+	a.Log.Info("Daily report phase=ai summaries ready",
+		"org", orgID, "rows", len(reportData.Chats), "filled_rows", filled, "ai", aiModel)
+
+	// Persist summary JSON before compose/send so History has data even if send fails later.
+	if b, err := json.Marshal(reportData); err == nil {
+		var m models.JSONB
+		if json.Unmarshal(b, &m) == nil {
+			run.SummaryJSON = m
+		}
+	}
+	_ = a.DB.Model(&run).Updates(map[string]any{
+		"ai_model":     run.AIModel,
+		"summary_json": run.SummaryJSON,
+		"error_message": run.ErrorMessage,
+	}).Error
+
+	// ── Phase 3: COMPOSE DOCX (only after summaries are ready) ────────
+	a.Log.Info("Daily report phase=compose start", "org", orgID, "rows", len(reportData.Chats))
 	docBytes, err := dailyreport.BuildDOCX(reportData)
 	if err != nil {
 		return fail("docx: " + err.Error())
+	}
+	if len(docBytes) < 64 {
+		return fail("docx: generated file too small (empty or corrupt)")
 	}
 
 	filename := fmt.Sprintf("daily-chat-report-%s.docx", reportDate)
@@ -194,24 +242,27 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	if err != nil {
 		return fail("save docx: " + err.Error())
 	}
-	run.PDFPath = docPath // column stores report file path (docx)
+	run.PDFPath = docPath
 	run.PDFFilename = filename
+	_ = a.DB.Model(&run).Updates(map[string]any{
+		"pdf_path":     run.PDFPath,
+		"pdf_filename": run.PDFFilename,
+	}).Error
+	a.Log.Info("Daily report phase=compose done",
+		"org", orgID, "file", filename, "bytes", len(docBytes), "path", docPath)
 
-	if b, err := json.Marshal(reportData); err == nil {
-		var m models.JSONB
-		if json.Unmarshal(b, &m) == nil {
-			run.SummaryJSON = m
-		}
-	}
-
-	// Send after AI + DOCX are fully ready
-	a.Log.Info("Daily report: sending DOCX", "org", orgID, "recipients", len(settings.Recipients))
+	// ── Phase 4: SEND WHATSAPP (sync — only after collect + AI + DOCX) ─
+	a.Log.Info("Daily report phase=send start",
+		"org", orgID, "recipients", len(settings.Recipients), "template", settings.ReportTemplateName)
 	sent, sendErrs := a.sendDailyReportFile(settings, &run, docBytes, filename, reportData)
 	run.SentCount = sent
 	if len(sendErrs) > 0 {
 		run.SendErrors = strings.Join(sendErrs, "; ")
 	}
+	a.Log.Info("Daily report phase=send done",
+		"org", orgID, "sent", sent, "errors", len(sendErrs))
 
+	// ── Phase 5: FINALIZE ─────────────────────────────────────────────
 	finished := time.Now()
 	run.FinishedAt = &finished
 	if reportData.EmptyDay || len(chats) == 0 {
@@ -222,8 +273,9 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	if err := a.DB.Save(&run).Error; err != nil {
 		return &run, err
 	}
-	a.Log.Info("Daily report: complete",
-		"org", orgID, "status", run.Status, "sent", sent, "ai", aiModel, "file", filename)
+	a.Log.Info("Daily report phase=complete",
+		"org", orgID, "status", run.Status, "sent", sent, "ai", aiModel,
+		"file", filename, "elapsed", time.Since(pipelineStart))
 	return &run, nil
 }
 
@@ -233,33 +285,55 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		return nil, 0, err
 	}
 
-	// GORM maps WhatsAppAccount → column whats_app_account.
-	// Prefer selected WhatsApp account; if empty, include all accounts for the org.
+	// Prefer explicit Table+Scan with column aliases — custom Find/Select on
+	// Model(&Message{}) can leave Content empty on some GORM/driver combos.
 	type row struct {
-		ContactID    uuid.UUID
-		ProfileName  string
-		PhoneNumber  string
-		Direction    models.Direction
-		Content      string
-		MessageType  models.MessageType
-		TemplateName string
-		CreatedAt    time.Time
+		ContactID         uuid.UUID `gorm:"column:contact_id"`
+		ProfileName       string    `gorm:"column:profile_name"`
+		PhoneNumber       string    `gorm:"column:phone_number"`
+		Direction         string    `gorm:"column:direction"`
+		Content           string    `gorm:"column:content"`
+		MessageType       string    `gorm:"column:message_type"`
+		TemplateName      string    `gorm:"column:template_name"`
+		MediaFilename     string    `gorm:"column:media_filename"`
+		InteractiveJSON   string    `gorm:"column:interactive_json"`
+		CreatedAt         time.Time `gorm:"column:created_at"`
 	}
 
-	q := a.DB.Model(&models.Message{}).
-		Select("messages.contact_id, contacts.profile_name, contacts.phone_number, messages.direction, messages.content, messages.message_type, messages.template_name, messages.created_at").
+	// Cast jsonb → text so Scan never fails on interactive_data driver types.
+	q := a.DB.Table("messages").
+		Select(`messages.contact_id AS contact_id,
+			contacts.profile_name AS profile_name,
+			contacts.phone_number AS phone_number,
+			messages.direction AS direction,
+			COALESCE(messages.content, '') AS content,
+			COALESCE(messages.message_type, '') AS message_type,
+			COALESCE(messages.template_name, '') AS template_name,
+			COALESCE(messages.media_filename, '') AS media_filename,
+			COALESCE(messages.interactive_data::text, '') AS interactive_json,
+			messages.created_at AS created_at`).
 		Joins("JOIN contacts ON contacts.id = messages.contact_id AND contacts.deleted_at IS NULL").
 		Where("messages.organization_id = ? AND messages.deleted_at IS NULL", orgID).
 		Where("messages.created_at >= ? AND messages.created_at < ?", start, end).
-		Order("messages.contact_id, messages.created_at asc")
+		Order("messages.contact_id asc, messages.created_at asc")
 
 	if strings.TrimSpace(waAccount) != "" {
 		q = q.Where("messages.whats_app_account = ?", waAccount)
 	}
 
 	var rows []row
-	if err := q.Find(&rows).Error; err != nil {
+	if err := q.Scan(&rows).Error; err != nil {
 		return nil, 0, err
+	}
+
+	emptyContent := 0
+	withText := 0
+	for _, r := range rows {
+		if strings.TrimSpace(r.Content) == "" {
+			emptyContent++
+		} else {
+			withText++
+		}
 	}
 
 	a.Log.Info("Daily report collect diagnostics",
@@ -270,6 +344,8 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		"end_utc", end.UTC().Format(time.RFC3339),
 		"account_filter", strings.TrimSpace(waAccount),
 		"raw_rows", len(rows),
+		"rows_with_content", withText,
+		"rows_empty_content", emptyContent,
 	)
 
 	byContact := map[uuid.UUID]*dailyreport.ContactChat{}
@@ -277,6 +353,9 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 	total := 0
 
 	for _, r := range rows {
+		if r.ContactID == uuid.Nil {
+			continue
+		}
 		total++
 		cc, ok := byContact[r.ContactID]
 		if !ok {
@@ -285,12 +364,15 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 			}
 			name := strings.TrimSpace(r.ProfileName)
 			if name == "" {
-				name = r.PhoneNumber
+				name = strings.TrimSpace(r.PhoneNumber)
+			}
+			if name == "" {
+				name = "Unknown"
 			}
 			cc = &dailyreport.ContactChat{
 				ContactID: r.ContactID.String(),
 				Name:      name,
-				Phone:     r.PhoneNumber,
+				Phone:     strings.TrimSpace(r.PhoneNumber),
 				ChatDate:  reportDate,
 				Messages:  nil,
 			}
@@ -300,52 +382,139 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		if len(cc.Messages) >= maxMessagesPerContact {
 			continue
 		}
-		text := strings.TrimSpace(r.Content)
-		if text == "" {
-			// Enrich non-text / interactive rows so AI still has something useful.
-			switch r.MessageType {
-			case models.MessageTypeInteractive:
-				text = "[interactive reply]"
-			case models.MessageTypeImage:
-				text = "[image]"
-			case models.MessageTypeDocument:
-				text = "[document]"
-			case models.MessageTypeAudio:
-				text = "[audio]"
-			case models.MessageTypeVideo:
-				text = "[video]"
-			case models.MessageTypeTemplate:
-				if r.TemplateName != "" {
-					text = "[template: " + r.TemplateName + "]"
-				} else {
-					text = "[template]"
-				}
-			default:
-				if r.MessageType != "" {
-					text = "[" + string(r.MessageType) + "]"
-				} else {
-					text = "[message]"
-				}
-			}
+		var interactiveRaw []byte
+		if s := strings.TrimSpace(r.InteractiveJSON); s != "" && s != "null" && s != "{}" {
+			interactiveRaw = []byte(s)
 		}
+		text := extractMessageText(r.Content, r.MessageType, r.TemplateName, r.MediaFilename, interactiveRaw)
 		if utf8.RuneCountInString(text) > maxMsgChars {
 			text = string([]rune(text)[:maxMsgChars]) + "..."
 		}
+		dir := strings.TrimSpace(r.Direction)
+		if dir == "" {
+			dir = string(models.DirectionIncoming)
+		}
+		at := ""
+		if !r.CreatedAt.IsZero() {
+			at = r.CreatedAt.In(loc).Format("15:04")
+		}
 		cc.Messages = append(cc.Messages, dailyreport.ChatMessage{
-			Direction: string(r.Direction),
-			At:        r.CreatedAt.In(loc).Format("15:04"),
+			Direction: dir,
+			At:        at,
 			Text:      text,
 		})
 		cc.MessageCount++
 	}
 
 	out := make([]dailyreport.ContactChat, 0, len(order))
+	msgsWithText := 0
 	for i, id := range order {
 		cc := *byContact[id]
 		cc.Serial = i + 1
+		for _, m := range cc.Messages {
+			if strings.TrimSpace(m.Text) != "" {
+				msgsWithText++
+			}
+		}
 		out = append(out, cc)
 	}
+
+	// Sample first chat for ops debugging (no full PII dump)
+	sampleLen := 0
+	sampleDir := ""
+	if len(out) > 0 && len(out[0].Messages) > 0 {
+		sampleLen = utf8.RuneCountInString(out[0].Messages[0].Text)
+		sampleDir = out[0].Messages[0].Direction
+	}
+	a.Log.Info("Daily report collect result",
+		"org", orgID,
+		"contacts", len(out),
+		"message_rows", total,
+		"messages_with_text", msgsWithText,
+		"sample_msg_runes", sampleLen,
+		"sample_dir", sampleDir,
+	)
 	return out, total, nil
+}
+
+// extractMessageText builds a human-readable line for the report from DB fields.
+// Content is preferred; interactive JSON / media / template fill in when content is empty.
+func extractMessageText(content, msgType, templateName, mediaFilename string, interactiveRaw []byte) string {
+	text := strings.TrimSpace(content)
+	if text != "" {
+		return text
+	}
+
+	// Interactive payload often has body / button titles when content was not denormalized.
+	if len(interactiveRaw) > 0 && string(interactiveRaw) != "null" && string(interactiveRaw) != "{}" {
+		var m map[string]any
+		if json.Unmarshal(interactiveRaw, &m) == nil {
+			if body, ok := m["body"].(string); ok && strings.TrimSpace(body) != "" {
+				return strings.TrimSpace(body)
+			}
+			if bt, ok := m["button_text"].(string); ok && strings.TrimSpace(bt) != "" {
+				return strings.TrimSpace(bt)
+			}
+			if dt, ok := m["display_text"].(string); ok && strings.TrimSpace(dt) != "" {
+				return strings.TrimSpace(dt)
+			}
+			// button reply style: {type, buttons:[{title}]} or single title
+			if title, ok := m["title"].(string); ok && strings.TrimSpace(title) != "" {
+				return strings.TrimSpace(title)
+			}
+			if buttons, ok := m["buttons"].([]any); ok && len(buttons) > 0 {
+				titles := make([]string, 0, len(buttons))
+				for _, b := range buttons {
+					if bm, ok := b.(map[string]any); ok {
+						if t, ok := bm["title"].(string); ok && strings.TrimSpace(t) != "" {
+							titles = append(titles, strings.TrimSpace(t))
+						}
+					}
+				}
+				if len(titles) > 0 {
+					return "[buttons: " + strings.Join(titles, " | ") + "]"
+				}
+			}
+		}
+	}
+
+	mt := strings.ToLower(strings.TrimSpace(msgType))
+	switch mt {
+	case string(models.MessageTypeInteractive), "button_reply", "button", "list_reply":
+		return "[interactive reply]"
+	case string(models.MessageTypeImage):
+		return "[image]"
+	case string(models.MessageTypeDocument):
+		if mediaFilename != "" {
+			return "[document: " + mediaFilename + "]"
+		}
+		return "[document]"
+	case string(models.MessageTypeAudio):
+		return "[audio]"
+	case string(models.MessageTypeVideo):
+		return "[video]"
+	case string(models.MessageTypeTemplate):
+		if templateName != "" {
+			return "[template: " + templateName + "]"
+		}
+		return "[template]"
+	case string(models.MessageTypeFlow), "nfm_reply":
+		return "[flow response]"
+	case string(models.MessageTypeLocation):
+		return "[location]"
+	case string(models.MessageTypeContact):
+		return "[contact card]"
+	case string(models.MessageTypeReaction):
+		return "[reaction]"
+	default:
+		if mediaFilename != "" {
+			return "[file: " + mediaFilename + "]"
+		}
+		if mt != "" {
+			return "[" + mt + "]"
+		}
+		return "[message]"
+	}
 }
 
 func (a *App) summarizeDailyChats(
@@ -443,9 +612,13 @@ func (a *App) summarizeDailyChats(
 			return dailyreport.ReportData{}, "", err
 		}
 
-		a.Log.Info("Daily report AI batch",
-			"org", orgID, "from_id", batch[0].Serial, "to_id", batch[len(batch)-1].Serial, "count", len(batch))
+		batchNo := start/aiBatchSize + 1
+		totalBatches := (len(chats) + aiBatchSize - 1) / aiBatchSize
+		a.Log.Info("Daily report AI batch waiting",
+			"org", orgID, "batch", batchNo, "of", totalBatches,
+			"from_id", batch[0].Serial, "to_id", batch[len(batch)-1].Serial, "count", len(batch))
 
+		batchStart := time.Now()
 		answer, err := a.callDailyReportLLM(&aiSettings, string(userJSON))
 		if err != nil {
 			return dailyreport.ReportData{}, "", fmt.Errorf("batch %d-%d: %w", batch[0].Serial, batch[len(batch)-1].Serial, err)
@@ -458,9 +631,15 @@ func (a *App) summarizeDailyChats(
 			return dailyreport.ReportData{}, "", fmt.Errorf("parse AI JSON (batch %d): %w; raw=%s", batch[0].Serial, err, truncateForLog(answer, 400))
 		}
 		allItems = append(allItems, parsed.Items...)
+		a.Log.Info("Daily report AI batch complete",
+			"org", orgID, "batch", batchNo, "of", totalBatches,
+			"items", len(parsed.Items), "elapsed", time.Since(batchStart))
 	}
 
+	// All AI batches finished — only then merge + return (caller composes DOCX next).
 	merged := dailyreport.MergeAISummaries(reportDate, orgName, generatedAt, modelLabel, chats, allItems)
+	a.Log.Info("Daily report AI all batches complete",
+		"org", orgID, "items", len(allItems), "rows", len(merged.Chats), "model", modelLabel)
 	return merged, modelLabel, nil
 }
 
@@ -598,7 +777,11 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 		templateOK := false
 		docOK := false
 		var lastErr error
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		// Long enough for Meta upload + template/document send (sync wait).
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+
+		// Sync send options — wait for Meta before marking recipient done.
+		sendOpts := DailyReportSendOptions()
 
 		// 1) Selected utility/text template — works outside 24h.
 		if template != nil {
@@ -615,11 +798,12 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 				req.HeaderMediaFilename = filename
 				req.MediaMimeType = mime
 			}
-			if _, err := a.SendOutgoingMessage(ctx, req, DefaultSendOptions()); err != nil {
+			if _, err := a.SendOutgoingMessage(ctx, req, sendOpts); err != nil {
 				lastErr = err
 				a.Log.Warn("Daily report template send failed", "recipient", r.Name, "error", err)
 			} else {
 				templateOK = true
+				a.Log.Info("Daily report template sent", "recipient", r.Name, "phone", phone)
 			}
 		}
 
@@ -635,11 +819,12 @@ func (a *App) sendDailyReportFile(settings *models.DailyReportSettings, run *mod
 				MediaFilename: filename,
 				Caption:       caption,
 			}
-			if _, err := a.SendOutgoingMessage(ctx, req2, DefaultSendOptions()); err != nil {
+			if _, err := a.SendOutgoingMessage(ctx, req2, sendOpts); err != nil {
 				lastErr = err
 				a.Log.Warn("Daily report free-form document failed", "recipient", r.Name, "error", err)
 			} else {
 				docOK = true
+				a.Log.Info("Daily report document sent", "recipient", r.Name, "phone", phone)
 			}
 		}
 		cancel()

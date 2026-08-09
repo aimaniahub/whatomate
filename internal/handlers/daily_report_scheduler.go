@@ -113,8 +113,8 @@ func (p *DailyReportScheduler) processOrgSchedule(s *models.DailyReportSettings,
 			return
 		}
 		if existing.Status == models.DailyReportStatusRunning {
-			// Allow reclaim of stuck runs after 30 minutes.
-			if existing.StartedAt != nil && time.Since(*existing.StartedAt) < 30*time.Minute {
+			// AI + compose can take a while — do not reclaim while still within window.
+			if existing.StartedAt != nil && time.Since(*existing.StartedAt) < dailyReportStuckAfter {
 				return
 			}
 		}

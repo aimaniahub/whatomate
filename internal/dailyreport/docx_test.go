@@ -45,9 +45,48 @@ func TestBuildDOCX_WithChats(t *testing.T) {
 	require.Contains(t, docXML, "Darvi Group")
 	require.Contains(t, docXML, "Ravi Kumar")
 	require.Contains(t, docXML, "Daily Chat Report")
+	require.Contains(t, docXML, "Sandalwood") // summary / msg excerpt must appear
 	require.Contains(t, docXML, "w:tbl")
 	require.NotContains(t, docXML, "openrouter")
 	require.NotContains(t, docXML, "secret-model")
+}
+
+func TestEnsureFilledSummaries_FillsBlankBullets(t *testing.T) {
+	chats := []ContactChat{
+		{
+			Serial: 1, Name: "Asha", Phone: "911", ChatDate: "2026-07-31",
+			Messages: []ChatMessage{
+				{Direction: "incoming", At: "10:00", Text: "Need pricing for IoT"},
+				{Direction: "outgoing", At: "10:01", Text: "Sure, sending quote"},
+			},
+		},
+	}
+	// Simulate AI returning empty rows / blank bullets
+	data := ReportData{
+		ReportDate: "2026-07-31",
+		OrgName:    "Org",
+		Chats: []ChatSummary{
+			{Serial: 1, Name: "Asha", Phone: "911", Date: "2026-07-31", Bullets: nil, Summary: ""},
+		},
+	}
+	filled := EnsureFilledSummaries(data, chats)
+	require.Len(t, filled.Chats, 1)
+	require.NotEmpty(t, filled.Chats[0].Bullets)
+	require.Contains(t, filled.Chats[0].Bullets[0], "pricing")
+	require.NotEmpty(t, filled.Chats[0].Excerpts)
+	require.Contains(t, filled.Chats[0].Excerpts[0], "Need pricing")
+
+	docx, err := BuildDOCX(filled)
+	require.NoError(t, err)
+	require.True(t, bytes.HasPrefix(docx, []byte("PK")))
+}
+
+func TestBulletsFromMessages_FallbackOutgoing(t *testing.T) {
+	// Only outgoing — still produce bullets (was a blank-summary cause)
+	msgs := []ChatMessage{{Direction: "outgoing", Text: "Your order is ready"}}
+	b := BulletsFromMessages(msgs, 3)
+	require.Len(t, b, 1)
+	require.Contains(t, b[0], "order is ready")
 }
 
 func TestBuildDOCX_Empty(t *testing.T) {

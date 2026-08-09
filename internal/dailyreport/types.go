@@ -20,16 +20,18 @@ type ContactChat struct {
 	Messages     []ChatMessage `json:"messages"`
 }
 
-// ChatSummary is one PDF row after AI merge.
+// ChatSummary is one report row after AI merge / fallback.
 type ChatSummary struct {
-	Serial   int      `json:"serial"`
-	Date     string   `json:"date"`
-	Name     string   `json:"name"`
-	Phone    string   `json:"phone"`
-	// Bullets are max 3 short AI summary points.
-	Bullets  []string `json:"bullets"`
+	Serial int    `json:"serial"`
+	Date   string `json:"date"`
+	Name   string `json:"name"`
+	Phone  string `json:"phone"`
+	// Bullets are max 3 short AI (or rule-based) summary points.
+	Bullets []string `json:"bullets"`
 	// Summary is bullets joined for storage/search (optional).
-	Summary  string   `json:"summary"`
+	Summary string `json:"summary"`
+	// Excerpts are raw transcript lines so the DOCX never shows a blank Summary cell.
+	Excerpts []string `json:"excerpts,omitempty"`
 }
 
 // DayOverview is the day-level rollup.

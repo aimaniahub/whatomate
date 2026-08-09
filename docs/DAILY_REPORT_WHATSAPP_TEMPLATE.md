@@ -87,13 +87,17 @@ Recommended: keep header **static** `Daily Chat Report` for simplicity.
 
 ---
 
-## Flow in code
+## Flow in code (production — fully sequential)
 
 ```text
-For each active recipient on the report page only:
-  1. Send APPROVED utility TEXT template (cold OK)
-  2. If recipient last_inbound < 24h → also try free-form DOCX
-  3. Always keep DOCX in History for download
+1. COLLECT  chats/messages for local calendar day (wait until query done)
+2. AI       summarize in batches (wait until ALL batches finish)
+            → rule-based fallback if AI fails (still wait for full result)
+3. COMPOSE  Word DOCX from summaries + message excerpts (save to disk)
+4. SEND     WhatsApp SYNC (wait for Meta per recipient):
+              a. APPROVED utility template (cold OK outside 24h)
+              b. Free-form DOCX only if 24h window open
+5. History  always has the DOCX for download
 ```
 
-No-chat days still send the template (`{{2}}` = `0`, `{{3}}` = no-chats label).
+No step 4 until steps 1–3 succeed. No-chat days still send the template (`{{2}}` = `0`, `{{3}}` = no-chats label).

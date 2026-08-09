@@ -140,6 +140,17 @@ func SLASendOptions() MessageSendOptions {
 	}
 }
 
+// DailyReportSendOptions waits for Meta to accept each message before continuing.
+// Used after AI + DOCX are fully ready so schedule/manual never "finish" before WhatsApp send.
+func DailyReportSendOptions() MessageSendOptions {
+	return MessageSendOptions{
+		BroadcastWebSocket: true,
+		DispatchWebhook:    true,
+		TrackSLA:           false,
+		Async:              false, // MUST be sync — wait for send complete
+	}
+}
+
 // SendOutgoingMessage is the unified method for sending all types of WhatsApp messages.
 // It handles: text, media (image/video/audio/document), interactive (buttons/list/cta_url), and template messages.
 func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageRequest, opts MessageSendOptions) (*models.Message, error) {

@@ -80,15 +80,15 @@ func buildDocumentXML(data ReportData) string {
 	}
 	b.WriteString(`</w:tr>`)
 
-	// Data rows
+	// Data rows — every cell has a non-empty value so Word never shows blank fields.
 	for _, chat := range data.Chats {
 		summary := formatSummaryCell(chat)
 		vals := []string{
-			fmt.Sprintf("%d", chat.Serial),
-			nonEmpty(chat.Date, data.ReportDate),
-			nonEmpty(chat.Name, "-"),
-			nonEmpty(chat.Phone, "-"),
-			summary,
+			fmt.Sprintf("%d", nonZeroSerial(chat.Serial)),
+			nonEmpty(chat.Date, nonEmpty(data.ReportDate, "—")),
+			nonEmpty(chat.Name, nonEmpty(chat.Phone, "Unknown")),
+			nonEmpty(chat.Phone, "—"),
+			nonEmpty(summary, "No message text available"),
 		}
 		fill := "FFFFFF"
 		if chat.Serial%2 == 0 {
@@ -109,22 +109,52 @@ func buildDocumentXML(data ReportData) string {
 	return b.String()
 }
 
+func nonZeroSerial(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	return n
+}
+
 func formatSummaryCell(c ChatSummary) string {
-	if len(c.Bullets) > 0 {
-		parts := make([]string, 0, len(c.Bullets))
-		for _, bl := range c.Bullets {
-			bl = strings.TrimSpace(bl)
-			if bl == "" {
-				continue
-			}
-			// plain dashes for Word (not fancy bullets that break encoding)
-			parts = append(parts, "- "+bl)
+	parts := make([]string, 0, 8)
+
+	// 1) Summary bullets (AI or rule-based)
+	for _, bl := range c.Bullets {
+		bl = strings.TrimSpace(bl)
+		if bl == "" {
+			continue
 		}
-		if len(parts) > 0 {
-			return strings.Join(parts, "\n")
+		// plain dashes for Word (not fancy bullets that break encoding)
+		parts = append(parts, "- "+bl)
+	}
+
+	// 2) If bullets empty, use joined Summary string
+	if len(parts) == 0 {
+		if s := strings.TrimSpace(c.Summary); s != "" && s != "—" {
+			parts = append(parts, "- "+s)
 		}
 	}
-	return nonEmpty(c.Summary, "—")
+
+	// 3) Always append raw message excerpts when present so the cell is never
+	// blank even if the model returned empty bullets.
+	if len(c.Excerpts) > 0 {
+		if len(parts) > 0 {
+			parts = append(parts, "Msgs:")
+		}
+		for _, ex := range c.Excerpts {
+			ex = strings.TrimSpace(ex)
+			if ex == "" {
+				continue
+			}
+			parts = append(parts, "• "+ex)
+		}
+	}
+
+	if len(parts) == 0 {
+		return "No message text available"
+	}
+	return strings.Join(parts, "\n")
 }
 
 func tc(width int, text string, bold bool, bg, fg string, multiline bool) string {

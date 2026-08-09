@@ -530,15 +530,16 @@ export const dailyReportsService = {
   }) => api.put('/analytics/daily-reports/settings', data),
   listRuns: () => api.get('/analytics/daily-reports/runs'),
   getRun: (id: string) => api.get(`/analytics/daily-reports/runs/${id}`),
+  // Wait for full pipeline: collect → AI (all batches) → DOCX → WhatsApp send (sync).
   runNow: (opts?: { date?: string }) =>
     api.post(
       '/analytics/daily-reports/run',
       {
         date: opts?.date || undefined
       },
-      { timeout: 180000 }
+      { timeout: 600000 } // 10 min — AI batches + Meta send
     ),
-  resend: (id: string) => api.post(`/analytics/daily-reports/runs/${id}/resend`),
+  resend: (id: string) => api.post(`/analytics/daily-reports/runs/${id}/resend`, null, { timeout: 120000 }),
   downloadUrl: (id: string) => `/api/analytics/daily-reports/runs/${id}/download`
 }
 
