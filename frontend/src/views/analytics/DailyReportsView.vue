@@ -728,8 +728,9 @@ onMounted(load)
                   placeholder="Prompt that structures bullet summaries as JSON by chat id…"
                 />
                 <p class="text-xs text-muted-foreground">
-                  Must ask for JSON with items[].id and items[].bullets (max 3). Name/phone are filled from
-                  the database after AI runs.
+                  Keep it simple: short customer-intent bullets. JSON uses id only for mapping (not shown in
+                  the Word file). Name/phone come from the database. Raw chat lines are not shown when AI
+                  succeeds — only if AI fails twice.
                 </p>
               </div>
             </div>

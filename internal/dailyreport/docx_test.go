@@ -61,32 +61,57 @@ func TestEnsureFilledSummaries_FillsBlankBullets(t *testing.T) {
 			},
 		},
 	}
-	// Simulate AI returning empty rows / blank bullets
+	// Simulate AI returning empty rows / blank bullets (AI path → no raw Msgs dual render)
 	data := ReportData{
 		ReportDate: "2026-07-31",
 		OrgName:    "Org",
+		AIUsed:     true,
 		Chats: []ChatSummary{
-			{Serial: 1, Name: "Asha", Phone: "911", Date: "2026-07-31", Bullets: nil, Summary: ""},
+			{Serial: 1, Name: "Asha", Phone: "911", Date: "2026-07-31", Bullets: nil, Summary: "", Excerpts: []string{"in 10:00: Need pricing for IoT"}},
 		},
 	}
 	filled := EnsureFilledSummaries(data, chats)
 	require.Len(t, filled.Chats, 1)
 	require.NotEmpty(t, filled.Chats[0].Bullets)
 	require.Contains(t, filled.Chats[0].Bullets[0], "pricing")
-	require.NotEmpty(t, filled.Chats[0].Excerpts)
-	require.Contains(t, filled.Chats[0].Excerpts[0], "Need pricing")
+	// AI path: excerpts cleared so DOCX shows summary only
+	require.Empty(t, filled.Chats[0].Excerpts)
 
 	docx, err := BuildDOCX(filled)
 	require.NoError(t, err)
 	require.True(t, bytes.HasPrefix(docx, []byte("PK")))
+	// Summary only — no dual "Msgs:" dump
+	require.NotContains(t, string(mustDOCXXML(t, docx)), "Msgs:")
 }
 
-func TestBulletsFromMessages_FallbackOutgoing(t *testing.T) {
-	// Only outgoing — still produce bullets (was a blank-summary cause)
-	msgs := []ChatMessage{{Direction: "outgoing", Text: "Your order is ready"}}
-	b := BulletsFromMessages(msgs, 3)
-	require.Len(t, b, 1)
-	require.Contains(t, b[0], "order is ready")
+func mustDOCXXML(t *testing.T, docx []byte) string {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(docx), int64(len(docx)))
+	require.NoError(t, err)
+	for _, f := range zr.File {
+		if f.Name == "word/document.xml" {
+			rc, err := f.Open()
+			require.NoError(t, err)
+			buf := new(bytes.Buffer)
+			_, _ = buf.ReadFrom(rc)
+			_ = rc.Close()
+			return buf.String()
+		}
+	}
+	t.Fatal("document.xml missing")
+	return ""
+}
+
+func TestFormatSummaryCell_NoDualRender(t *testing.T) {
+	// When bullets exist, ignore excerpts completely
+	cell := formatSummaryCell(ChatSummary{
+		Bullets:  []string{"Customer asked about sandalwood"},
+		Excerpts: []string{"in 12:47: hi", "out 12:47: Hello welcome..."},
+	})
+	require.Contains(t, cell, "sandalwood")
+	require.NotContains(t, cell, "Msgs:")
+	require.NotContains(t, cell, "12:47")
+	require.NotContains(t, cell, "hi")
 }
 
 func TestBuildDOCX_Empty(t *testing.T) {

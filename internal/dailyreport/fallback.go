@@ -36,6 +36,12 @@ func FallbackSummarize(reportDate string, orgName string, chats []ContactChat) R
 		if date == "" {
 			date = reportDate
 		}
+		// Fallback path: short bullets from transcript (not dual AI+raw in DOCX).
+		// Excerpts kept only if bullets somehow empty — formatSummaryCell uses one or the other.
+		excerpts := []string(nil)
+		if len(bullets) == 0 {
+			excerpts = MessageExcerpts(c.Messages, 4)
+		}
 		out = append(out, ChatSummary{
 			Serial:   serial,
 			Date:     date,
@@ -43,7 +49,7 @@ func FallbackSummarize(reportDate string, orgName string, chats []ContactChat) R
 			Phone:    c.Phone,
 			Bullets:  bullets,
 			Summary:  strings.Join(bullets, " • "),
-			Excerpts: MessageExcerpts(c.Messages, 5),
+			Excerpts: excerpts,
 		})
 	}
 
@@ -63,7 +69,8 @@ func FallbackSummarize(reportDate string, orgName string, chats []ContactChat) R
 }
 
 // MergeAISummaries maps AI bullets by serial id onto source chats (name/phone/date from DB).
-// Always attaches message excerpts so the DOCX never has a blank summary cell.
+// Successful AI rows: clean bullets only (no raw Msgs: dump).
+// Per-row AI miss: short rule-based bullets from transcript (still no dual render).
 func MergeAISummaries(reportDate, orgName, generatedAt, aiModel string, chats []ContactChat, items []AISummaryItem) ReportData {
 	// Detect accidental 0-based ids (model returns 0..n-1 instead of 1..n).
 	zeroBased := false
@@ -96,7 +103,7 @@ func MergeAISummaries(reportDate, orgName, generatedAt, aiModel string, chats []
 		}
 		bullets := byID[serial]
 		if len(bullets) == 0 {
-			// AI missed this id — build from transcript (incoming first, then any).
+			// AI missed this id — short intent lines from transcript, not full raw dump.
 			bullets = BulletsFromMessages(c.Messages, 3)
 		}
 		date := c.ChatDate
@@ -104,13 +111,14 @@ func MergeAISummaries(reportDate, orgName, generatedAt, aiModel string, chats []
 			date = reportDate
 		}
 		out = append(out, ChatSummary{
-			Serial:   serial,
-			Date:     date,
-			Name:     nonEmpty(c.Name, c.Phone),
-			Phone:    c.Phone,
-			Bullets:  bullets,
-			Summary:  strings.Join(bullets, " • "),
-			Excerpts: MessageExcerpts(c.Messages, 5),
+			Serial:  serial,
+			Date:    date,
+			Name:    nonEmpty(c.Name, c.Phone),
+			Phone:   c.Phone,
+			Bullets: bullets,
+			Summary: strings.Join(bullets, " • "),
+			// No Excerpts on AI path — DOCX shows summary bullets only.
+			Excerpts: nil,
 		})
 	}
 
@@ -183,16 +191,19 @@ func EnsureFilledSummaries(data ReportData, chats []ContactChat) ReportData {
 			row.Bullets = BulletsFromMessages(src.Messages, 3)
 		}
 		if len(row.Bullets) == 0 {
-			row.Bullets = []string{"No message text available for this chat."}
+			row.Bullets = []string{"No clear customer request captured."}
 		}
 		row.Summary = strings.Join(row.Bullets, " • ")
 
-		if len(row.Excerpts) == 0 && ok {
-			row.Excerpts = MessageExcerpts(src.Messages, 5)
-		}
-		if len(row.Excerpts) == 0 {
-			// Last resort: mirror bullets so DOCX cell is never empty.
-			row.Excerpts = append([]string{}, row.Bullets...)
+		// Successful AI reports: never attach raw transcript (avoids dual Summary+Msgs render).
+		// Only keep/set Excerpts when this row still has no usable bullets (true last resort).
+		if data.AIUsed {
+			row.Excerpts = nil
+		} else if len(row.Excerpts) == 0 && len(row.Bullets) == 0 && ok {
+			row.Excerpts = MessageExcerpts(src.Messages, 4)
+		} else if data.AIUsed == false && len(row.Bullets) > 0 {
+			// Rule-based fallback already has bullets — do not also dump raw chats.
+			row.Excerpts = nil
 		}
 	}
 

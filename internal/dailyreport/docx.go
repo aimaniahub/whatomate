@@ -116,10 +116,12 @@ func nonZeroSerial(n int) int {
 	return n
 }
 
+// formatSummaryCell shows clean summary bullets only.
+// Raw message lines (Excerpts) are used only when there are no bullets —
+// i.e. AI failed and we fell back — never both at once.
 func formatSummaryCell(c ChatSummary) string {
-	parts := make([]string, 0, 8)
+	parts := make([]string, 0, 4)
 
-	// 1) Summary bullets (AI or rule-based)
 	for _, bl := range c.Bullets {
 		bl = strings.TrimSpace(bl)
 		if bl == "" {
@@ -129,32 +131,30 @@ func formatSummaryCell(c ChatSummary) string {
 		parts = append(parts, "- "+bl)
 	}
 
-	// 2) If bullets empty, use joined Summary string
-	if len(parts) == 0 {
-		if s := strings.TrimSpace(c.Summary); s != "" && s != "—" {
-			parts = append(parts, "- "+s)
-		}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n")
 	}
 
-	// 3) Always append raw message excerpts when present so the cell is never
-	// blank even if the model returned empty bullets.
+	if s := strings.TrimSpace(c.Summary); s != "" && s != "—" {
+		return "- " + s
+	}
+
+	// Fallback-only: raw transcript snippets (AI failed path)
 	if len(c.Excerpts) > 0 {
-		if len(parts) > 0 {
-			parts = append(parts, "Msgs:")
-		}
+		raw := make([]string, 0, len(c.Excerpts))
 		for _, ex := range c.Excerpts {
 			ex = strings.TrimSpace(ex)
 			if ex == "" {
 				continue
 			}
-			parts = append(parts, "• "+ex)
+			raw = append(raw, "• "+ex)
+		}
+		if len(raw) > 0 {
+			return strings.Join(raw, "\n")
 		}
 	}
 
-	if len(parts) == 0 {
-		return "No message text available"
-	}
-	return strings.Join(parts, "\n")
+	return "No message summary available"
 }
 
 func tc(width int, text string, bold bool, bg, fg string, multiline bool) string {

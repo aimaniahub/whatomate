@@ -32,17 +32,21 @@ const DefaultDailyReportTimezone = "Asia/Kolkata"
 const DefaultDailyReportSendTime = "20:00"
 
 // DefaultDailyReportAISystemPrompt is the built-in summarizer prompt (editable per org).
-const DefaultDailyReportAISystemPrompt = `You summarize WhatsApp chat transcripts for an operations daily report.
-Return ONLY valid JSON (no markdown fences) with this exact shape:
-{"items":[{"id":1,"bullets":["point one","point two","point three"]}]}
+// Keep it simple: clean customer-intent bullets for the Word report (no raw transcripts).
+const DefaultDailyReportAISystemPrompt = `You write short daily report summaries of WhatsApp customer chats for operations.
+
+Input: chats each with a number "id" and a list of messages (in = customer, out = business).
+
+Output: ONLY valid JSON (no markdown), one object:
+{"items":[{"id":1,"bullets":["Customer asked about …","…"]}]}
 
 Rules:
-- Each input chat has an integer "id". Echo the same id in your output.
-- For each id write at most 3 short bullet points (max 20 words each).
-- Capture the customer's overall query / intent only.
-- Base bullets ONLY on the messages provided. Do not invent facts.
-- Do not include names, phone numbers, or greetings.
-- Prefer inbound (customer) messages.`
+- Match each output "id" to the input chat id (needed for mapping only — never write ids in the bullet text).
+- 1 to 3 short bullets per chat (max ~15 words each).
+- Plain English: what the customer wanted or asked about.
+- Prefer customer (in) messages; ignore bot menus, greetings, and button lists unless that is the only content.
+- Do not invent facts. Do not put names, phone numbers, or message times in bullets.
+- If the customer only said hi / menu browsing with no clear ask, write one bullet like "Greeting / browsing menu — no clear request".`
 
 // DailyReportSettings is per-organization configuration for end-of-day chat reports.
 type DailyReportSettings struct {

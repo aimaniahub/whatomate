@@ -177,30 +177,40 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		aiModel = "none"
 		a.Log.Info("Daily report phase=ai skipped (empty day)", "org", orgID, "date", reportDate)
 	} else {
+		// AI with up to 2 attempts; only then fall back to rule-based (short bullets, not raw dump).
+		const aiMaxAttempts = 2
 		a.Log.Info("Daily report phase=ai start",
-			"org", orgID, "date", reportDate, "chats", len(chats), "messages", totalMsgs)
+			"org", orgID, "date", reportDate, "chats", len(chats), "messages", totalMsgs, "max_attempts", aiMaxAttempts)
 		aiStart := time.Now()
 		var sumErr error
-		reportData, aiModel, sumErr = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
-		if sumErr != nil {
-			// Still produce a usable report — never send before we have summaries.
-			a.Log.Error("Daily report phase=ai failed; using rule-based summaries",
+		for attempt := 1; attempt <= aiMaxAttempts; attempt++ {
+			reportData, aiModel, sumErr = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
+			if sumErr == nil && len(reportData.Chats) > 0 {
+				a.Log.Info("Daily report phase=ai done",
+					"org", orgID, "model", aiModel, "rows", len(reportData.Chats),
+					"ai_used", reportData.AIUsed, "attempt", attempt, "ai_elapsed", time.Since(aiStart))
+				break
+			}
+			a.Log.Warn("Daily report phase=ai attempt failed",
+				"org", orgID, "attempt", attempt, "of", aiMaxAttempts, "error", sumErr,
+				"rows", len(reportData.Chats))
+			if attempt < aiMaxAttempts {
+				time.Sleep(time.Duration(attempt) * 800 * time.Millisecond)
+			}
+		}
+		if sumErr != nil || len(reportData.Chats) == 0 {
+			a.Log.Error("Daily report phase=ai failed after retries; rule-based summary only",
 				"org", orgID, "error", sumErr, "chats", len(chats), "ai_elapsed", time.Since(aiStart))
 			reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
 			reportData.GeneratedAt = genAt
 			aiModel = "fallback"
-			run.ErrorMessage = "AI summarize failed (used rule-based summaries): " + sumErr.Error()
-		} else {
-			a.Log.Info("Daily report phase=ai done",
-				"org", orgID, "model", aiModel, "rows", len(reportData.Chats),
-				"ai_used", reportData.AIUsed, "ai_elapsed", time.Since(aiStart))
+			if sumErr != nil {
+				run.ErrorMessage = fmt.Sprintf("AI summarize failed after %d attempts (used short rule-based summaries): %v", aiMaxAttempts, sumErr)
+			} else {
+				run.ErrorMessage = fmt.Sprintf("AI returned empty rows after %d attempts (used short rule-based summaries)", aiMaxAttempts)
+			}
 		}
-		if len(reportData.Chats) == 0 && len(chats) > 0 {
-			reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
-			reportData.GeneratedAt = genAt
-			aiModel = "fallback"
-		}
-		// Fill any blank bullets from raw transcripts before compose.
+		// Fill blank bullets only; does not attach raw Msgs when AI succeeded.
 		reportData = dailyreport.EnsureFilledSummaries(reportData, chats)
 	}
 	run.AIModel = aiModel
