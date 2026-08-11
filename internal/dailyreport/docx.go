@@ -14,6 +14,54 @@ func BuildDOCX(data ReportData) ([]byte, error) {
 	return packDOCX(body)
 }
 
+// ValidateDOCXContent opens the DOCX package and ensures document.xml has
+// expected report content before we save/send (catches blank scheduled files).
+func ValidateDOCXContent(docx []byte, chatCount int) error {
+	if len(docx) < 100 || !bytes.HasPrefix(docx, []byte("PK")) {
+		return fmt.Errorf("invalid docx package")
+	}
+	zr, err := zip.NewReader(bytes.NewReader(docx), int64(len(docx)))
+	if err != nil {
+		return fmt.Errorf("open docx zip: %w", err)
+	}
+	var docXML string
+	for _, f := range zr.File {
+		if f.Name == "word/document.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				return fmt.Errorf("open document.xml: %w", err)
+			}
+			var buf bytes.Buffer
+			if _, err := buf.ReadFrom(rc); err != nil {
+				_ = rc.Close()
+				return fmt.Errorf("read document.xml: %w", err)
+			}
+			_ = rc.Close()
+			docXML = buf.String()
+			break
+		}
+	}
+	if docXML == "" {
+		return fmt.Errorf("document.xml missing")
+	}
+	if !strings.Contains(docXML, "Daily Chat Report") {
+		return fmt.Errorf("document missing report title")
+	}
+	if chatCount > 0 {
+		if strings.Contains(docXML, "No chats today") {
+			return fmt.Errorf("document says no chats but %d chats were collected", chatCount)
+		}
+		if !strings.Contains(docXML, "Total chats:") {
+			return fmt.Errorf("document missing total chats line")
+		}
+		// Table body should have at least one data-ish paragraph beyond headers
+		if !strings.Contains(docXML, "<w:tbl>") {
+			return fmt.Errorf("document missing chat table")
+		}
+	}
+	return nil
+}
+
 func buildDocumentXML(data ReportData) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)

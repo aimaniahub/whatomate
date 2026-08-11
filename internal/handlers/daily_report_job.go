@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,17 +27,20 @@ const (
 	aiBatchSize           = 12 // chats per AI call
 	// dailyReportStuckAfter: AI batches can run long — do not reclaim while still working.
 	dailyReportStuckAfter = 45 * time.Minute
+	// Min size for a real DOCX (PK zip + content). Tiny files are treated as blank.
+	minDailyReportDOCXBytes = 400
 )
 
-// RunDailyReport runs the full production pipeline **synchronously**:
+// RunDailyReport runs the production pipeline in strict order (same for manual + schedule):
 //
-//  1. Collect chats/messages for the local calendar day
-//  2. Wait for AI summary to complete (all batches) — or rule-based fallback
-//  3. Ensure every row has summary + message excerpts
-//  4. Compose DOCX and save to disk
-//  5. Send WhatsApp (sync — wait for Meta) only after steps 1–4 succeed
+//  1. COLLECT  chats
+//  2. AI       summarize (wait; retry 2×; then short rule-based)
+//  3. COMPOSE  DOCX from summaries
+//  4. SAVE     full run to DB + file on disk (verify file is non-blank)
+//  5. SEND     WhatsApp only after step 4 — re-read file from disk (never send unpersisted buffer)
 //
-// reportDate is YYYY-MM-DD in the settings timezone. Idempotent for schedule unless force.
+// reportDate is YYYY-MM-DD in the settings timezone.
+// force=true (manual): always regenerate. force=false (schedule): skip only if a usable report already exists.
 func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, force bool) (*models.DailyReportRun, error) {
 	pipelineStart := time.Now()
 	settings, err := a.getOrCreateDailyReportSettings(orgID)
@@ -59,8 +63,19 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	var run models.DailyReportRun
 	err = a.DB.Where("organization_id = ? AND report_date = ?", orgID, reportDate).First(&run).Error
 	if err == nil {
-		if !force && (run.Status == models.DailyReportStatusCompleted || run.Status == models.DailyReportStatusEmpty) {
-			return &run, nil
+		if !force && dailyreport.IsTerminalRunStatus(run.Status) {
+			// Schedule path used to return ANY completed/empty row — including blank/corrupt
+			// files from an earlier fire. Only skip when the report is actually usable.
+			if isUsableDailyReportRun(&run) {
+				a.Log.Info("Daily report skip: usable report already exists",
+					"org", orgID, "date", reportDate, "status", run.Status,
+					"chats", run.ChatCount, "path", run.PDFPath)
+				return &run, nil
+			}
+			a.Log.Warn("Daily report prior terminal run is blank/unusable — regenerating",
+				"org", orgID, "date", reportDate, "status", run.Status,
+				"chats", run.ChatCount, "path", run.PDFPath)
+			force = true // regenerate even though terminal
 		}
 		if run.Status == models.DailyReportStatusRunning {
 			if !force && run.StartedAt != nil && time.Since(*run.StartedAt) < dailyReportStuckAfter {
@@ -86,13 +101,12 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		if err := a.DB.Where("organization_id = ? AND report_date = ?", orgID, reportDate).First(&run).Error; err != nil {
 			return nil, err
 		}
-		if !force && (run.Status == models.DailyReportStatusCompleted || run.Status == models.DailyReportStatusEmpty) {
+		if !force && dailyreport.IsTerminalRunStatus(run.Status) && isUsableDailyReportRun(&run) {
 			return &run, nil
 		}
 	}
 
-	// Claim run as running. With force (manual), always overwrite.
-	// Without force, only claim if not terminal and not a fresh running job (race-safe).
+	// Claim run as running.
 	now := time.Now()
 	staleBefore := now.Add(-dailyReportStuckAfter)
 	updates := map[string]any{
@@ -102,6 +116,9 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		"error_message": "",
 		"send_errors":   "",
 		"sent_count":    0,
+		// Clear stale file pointers so we never send an old blank path by mistake.
+		"pdf_path":     "",
+		"pdf_filename": "",
 	}
 	q := a.DB.Model(&models.DailyReportRun{}).Where("id = ?", run.ID)
 	if !force {
@@ -120,11 +137,13 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		if err := a.DB.Where("id = ?", run.ID).First(&run).Error; err != nil {
 			return nil, err
 		}
-		if run.Status == models.DailyReportStatusCompleted || run.Status == models.DailyReportStatusEmpty {
+		if !force && dailyreport.IsTerminalRunStatus(run.Status) && isUsableDailyReportRun(&run) {
 			return &run, nil
 		}
-		if run.Status == models.DailyReportStatusRunning {
-			return &run, fmt.Errorf("report already running for %s", reportDate)
+		if run.Status == models.DailyReportStatusRunning && !force {
+			if run.StartedAt != nil && time.Since(*run.StartedAt) < dailyReportStuckAfter {
+				return &run, fmt.Errorf("report already running for %s", reportDate)
+			}
 		}
 		if err := a.DB.Model(&run).Updates(updates).Error; err != nil {
 			return nil, err
@@ -145,126 +164,37 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		return &run, fmt.Errorf("%s", msg)
 	}
 
-	orgName := ""
-	var org models.Organization
-	if err := a.DB.Select("id", "name").Where("id = ?", orgID).First(&org).Error; err == nil {
-		orgName = org.Name
-	}
-
-	// ── Phase 1: COLLECT ──────────────────────────────────────────────
-	a.Log.Info("Daily report phase=collect start", "org", orgID, "date", reportDate, "trigger", triggeredBy)
-	chats, totalMsgs, collectErr := a.collectDailyChats(orgID, settings.WhatsAppAccount, reportDate, loc)
-	if collectErr != nil {
-		return fail("collect chats: " + collectErr.Error())
-	}
-	run.ChatCount = len(chats)
-	run.MessageCount = totalMsgs
-	_ = a.DB.Model(&run).Updates(map[string]any{
-		"chat_count":    run.ChatCount,
-		"message_count": run.MessageCount,
-	}).Error
-	a.Log.Info("Daily report phase=collect done",
-		"org", orgID, "chats", len(chats), "messages", totalMsgs, "elapsed", time.Since(pipelineStart))
-
-	// ── Phase 2: AI SUMMARY (wait until all batches finish) ───────────
-	genAt := time.Now().In(loc).Format("2006-01-02 15:04")
-	var reportData dailyreport.ReportData
-	var aiModel string
-
-	if len(chats) == 0 {
-		reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
-		reportData.GeneratedAt = genAt
-		aiModel = "none"
-		a.Log.Info("Daily report phase=ai skipped (empty day)", "org", orgID, "date", reportDate)
-	} else {
-		// AI with up to 2 attempts; only then fall back to rule-based (short bullets, not raw dump).
-		const aiMaxAttempts = 2
-		a.Log.Info("Daily report phase=ai start",
-			"org", orgID, "date", reportDate, "chats", len(chats), "messages", totalMsgs, "max_attempts", aiMaxAttempts)
-		aiStart := time.Now()
-		var sumErr error
-		for attempt := 1; attempt <= aiMaxAttempts; attempt++ {
-			reportData, aiModel, sumErr = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
-			if sumErr == nil && len(reportData.Chats) > 0 {
-				a.Log.Info("Daily report phase=ai done",
-					"org", orgID, "model", aiModel, "rows", len(reportData.Chats),
-					"ai_used", reportData.AIUsed, "attempt", attempt, "ai_elapsed", time.Since(aiStart))
-				break
-			}
-			a.Log.Warn("Daily report phase=ai attempt failed",
-				"org", orgID, "attempt", attempt, "of", aiMaxAttempts, "error", sumErr,
-				"rows", len(reportData.Chats))
-			if attempt < aiMaxAttempts {
-				time.Sleep(time.Duration(attempt) * 800 * time.Millisecond)
-			}
-		}
-		if sumErr != nil || len(reportData.Chats) == 0 {
-			a.Log.Error("Daily report phase=ai failed after retries; rule-based summary only",
-				"org", orgID, "error", sumErr, "chats", len(chats), "ai_elapsed", time.Since(aiStart))
-			reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
-			reportData.GeneratedAt = genAt
-			aiModel = "fallback"
-			if sumErr != nil {
-				run.ErrorMessage = fmt.Sprintf("AI summarize failed after %d attempts (used short rule-based summaries): %v", aiMaxAttempts, sumErr)
-			} else {
-				run.ErrorMessage = fmt.Sprintf("AI returned empty rows after %d attempts (used short rule-based summaries)", aiMaxAttempts)
-			}
-		}
-		// Fill blank bullets only; does not attach raw Msgs when AI succeeded.
-		reportData = dailyreport.EnsureFilledSummaries(reportData, chats)
+	// ── A) GENERATE (collect → AI → DOCX) — no WhatsApp yet ───────────
+	reportData, chats, aiModel, genErr := a.generateDailyReportContent(orgID, settings, &run, reportDate, loc)
+	if genErr != nil {
+		return fail(genErr.Error())
 	}
 	run.AIModel = aiModel
 
-	filled := 0
-	for _, c := range reportData.Chats {
-		if strings.TrimSpace(c.Summary) != "" || len(c.Bullets) > 0 || len(c.Excerpts) > 0 {
-			filled++
-		}
-	}
-	a.Log.Info("Daily report phase=ai summaries ready",
-		"org", orgID, "rows", len(reportData.Chats), "filled_rows", filled, "ai", aiModel)
-
-	// Persist summary JSON before compose/send so History has data even if send fails later.
-	if b, err := json.Marshal(reportData); err == nil {
-		var m models.JSONB
-		if json.Unmarshal(b, &m) == nil {
-			run.SummaryJSON = m
-		}
-	}
-	_ = a.DB.Model(&run).Updates(map[string]any{
-		"ai_model":     run.AIModel,
-		"summary_json": run.SummaryJSON,
-		"error_message": run.ErrorMessage,
-	}).Error
-
-	// ── Phase 3: COMPOSE DOCX (only after summaries are ready) ────────
-	a.Log.Info("Daily report phase=compose start", "org", orgID, "rows", len(reportData.Chats))
-	docBytes, err := dailyreport.BuildDOCX(reportData)
-	if err != nil {
-		return fail("docx: " + err.Error())
-	}
-	if len(docBytes) < 64 {
-		return fail("docx: generated file too small (empty or corrupt)")
-	}
-
+	// ── B) SAVE to disk + DB first (gate before any send) ─────────────
 	filename := fmt.Sprintf("daily-chat-report-%s.docx", reportDate)
-	docPath, err := a.saveDailyReportFile(orgID, reportDate, filename, docBytes)
-	if err != nil {
-		return fail("save docx: " + err.Error())
+	docPath, docBytes, saveErr := a.persistDailyReportArtifact(orgID, &run, reportDate, filename, reportData, chats)
+	if saveErr != nil {
+		return fail(saveErr.Error())
 	}
-	run.PDFPath = docPath
-	run.PDFFilename = filename
-	_ = a.DB.Model(&run).Updates(map[string]any{
-		"pdf_path":     run.PDFPath,
-		"pdf_filename": run.PDFFilename,
-	}).Error
-	a.Log.Info("Daily report phase=compose done",
-		"org", orgID, "file", filename, "bytes", len(docBytes), "path", docPath)
+	a.Log.Info("Daily report phase=saved (ready to send)",
+		"org", orgID, "path", docPath, "bytes", len(docBytes),
+		"chats", run.ChatCount, "summary_rows", len(reportData.Chats))
 
-	// ── Phase 4: SEND WHATSAPP (sync — only after collect + AI + DOCX) ─
+	// ── C) RE-READ from disk — send only what is stored ───────────────
+	diskBytes, err := os.ReadFile(docPath)
+	if err != nil {
+		return fail("read saved report for send: " + err.Error())
+	}
+	if err := validateDailyReportDOCX(diskBytes, len(chats)); err != nil {
+		return fail("saved report validation failed: " + err.Error())
+	}
+
+	// ── D) SEND WhatsApp (sync) only after DB + disk are good ─────────
 	a.Log.Info("Daily report phase=send start",
-		"org", orgID, "recipients", len(settings.Recipients), "template", settings.ReportTemplateName)
-	sent, sendErrs := a.sendDailyReportFile(settings, &run, docBytes, filename, reportData)
+		"org", orgID, "recipients", len(settings.Recipients),
+		"template", settings.ReportTemplateName, "file_bytes", len(diskBytes))
+	sent, sendErrs := a.sendDailyReportFile(settings, &run, diskBytes, filename, reportData)
 	run.SentCount = sent
 	if len(sendErrs) > 0 {
 		run.SendErrors = strings.Join(sendErrs, "; ")
@@ -272,7 +202,7 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	a.Log.Info("Daily report phase=send done",
 		"org", orgID, "sent", sent, "errors", len(sendErrs))
 
-	// ── Phase 5: FINALIZE ─────────────────────────────────────────────
+	// ── E) FINALIZE status ────────────────────────────────────────────
 	finished := time.Now()
 	run.FinishedAt = &finished
 	if reportData.EmptyDay || len(chats) == 0 {
@@ -287,6 +217,216 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 		"org", orgID, "status", run.Status, "sent", sent, "ai", aiModel,
 		"file", filename, "elapsed", time.Since(pipelineStart))
 	return &run, nil
+}
+
+// generateDailyReportContent collects messages and builds structured summaries (AI or fallback).
+// Does not write files or send WhatsApp.
+func (a *App) generateDailyReportContent(
+	orgID uuid.UUID,
+	settings *models.DailyReportSettings,
+	run *models.DailyReportRun,
+	reportDate string,
+	loc *time.Location,
+) (reportData dailyreport.ReportData, chats []dailyreport.ContactChat, aiModel string, err error) {
+	orgName := ""
+	var org models.Organization
+	if e := a.DB.Select("id", "name").Where("id = ?", orgID).First(&org).Error; e == nil {
+		orgName = org.Name
+	}
+
+	a.Log.Info("Daily report phase=collect start",
+		"org", orgID, "date", reportDate, "account", settings.WhatsAppAccount, "tz", loc.String())
+	chats, totalMsgs, collectErr := a.collectDailyChats(orgID, settings.WhatsAppAccount, reportDate, loc)
+	if collectErr != nil {
+		return reportData, nil, "", fmt.Errorf("collect chats: %w", collectErr)
+	}
+	run.ChatCount = len(chats)
+	run.MessageCount = totalMsgs
+	_ = a.DB.Model(run).Updates(map[string]any{
+		"chat_count":    run.ChatCount,
+		"message_count": run.MessageCount,
+	}).Error
+	a.Log.Info("Daily report phase=collect done",
+		"org", orgID, "chats", len(chats), "messages", totalMsgs)
+
+	genAt := time.Now().In(loc).Format("2006-01-02 15:04")
+
+	if len(chats) == 0 {
+		reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
+		reportData.GeneratedAt = genAt
+		aiModel = "none"
+		a.Log.Info("Daily report phase=ai skipped (empty day)", "org", orgID, "date", reportDate)
+		return reportData, chats, aiModel, nil
+	}
+
+	const aiMaxAttempts = 2
+	a.Log.Info("Daily report phase=ai start",
+		"org", orgID, "chats", len(chats), "max_attempts", aiMaxAttempts)
+	aiStart := time.Now()
+	var sumErr error
+	for attempt := 1; attempt <= aiMaxAttempts; attempt++ {
+		reportData, aiModel, sumErr = a.summarizeDailyChats(orgID, settings.WhatsAppAccount, reportDate, orgName, genAt, chats)
+		if sumErr == nil && len(reportData.Chats) > 0 {
+			a.Log.Info("Daily report phase=ai done",
+				"org", orgID, "model", aiModel, "rows", len(reportData.Chats),
+				"attempt", attempt, "ai_elapsed", time.Since(aiStart))
+			break
+		}
+		a.Log.Warn("Daily report phase=ai attempt failed",
+			"org", orgID, "attempt", attempt, "of", aiMaxAttempts, "error", sumErr)
+		if attempt < aiMaxAttempts {
+			time.Sleep(time.Duration(attempt) * 800 * time.Millisecond)
+		}
+	}
+	if sumErr != nil || len(reportData.Chats) == 0 {
+		a.Log.Error("Daily report phase=ai failed after retries; rule-based only",
+			"org", orgID, "error", sumErr, "chats", len(chats))
+		reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
+		reportData.GeneratedAt = genAt
+		aiModel = "fallback"
+		if sumErr != nil {
+			run.ErrorMessage = fmt.Sprintf("AI summarize failed after %d attempts (rule-based summaries): %v", aiMaxAttempts, sumErr)
+		} else {
+			run.ErrorMessage = fmt.Sprintf("AI returned empty rows after %d attempts (rule-based summaries)", aiMaxAttempts)
+		}
+	}
+	reportData = dailyreport.EnsureFilledSummaries(reportData, chats)
+
+	// Hard guarantee: if we collected chats, we must have summary rows before save/send.
+	if len(chats) > 0 && len(reportData.Chats) == 0 {
+		return reportData, chats, aiModel, fmt.Errorf("summary rows empty after collect had %d chats", len(chats))
+	}
+	filled := 0
+	for _, c := range reportData.Chats {
+		if strings.TrimSpace(c.Summary) != "" || len(c.Bullets) > 0 {
+			filled++
+		}
+	}
+	if len(chats) > 0 && filled == 0 {
+		return reportData, chats, aiModel, fmt.Errorf("all summary rows blank after collect had %d chats", len(chats))
+	}
+	a.Log.Info("Daily report phase=ai summaries ready",
+		"org", orgID, "rows", len(reportData.Chats), "filled_rows", filled, "ai", aiModel)
+	return reportData, chats, aiModel, nil
+}
+
+// persistDailyReportArtifact builds DOCX, writes disk, saves full run snapshot to DB.
+// Send must not run until this returns successfully.
+func (a *App) persistDailyReportArtifact(
+	orgID uuid.UUID,
+	run *models.DailyReportRun,
+	reportDate, filename string,
+	reportData dailyreport.ReportData,
+	chats []dailyreport.ContactChat,
+) (docPath string, docBytes []byte, err error) {
+	a.Log.Info("Daily report phase=compose start", "org", orgID, "rows", len(reportData.Chats))
+	docBytes, err = dailyreport.BuildDOCX(reportData)
+	if err != nil {
+		return "", nil, fmt.Errorf("docx: %w", err)
+	}
+	if err := validateDailyReportDOCX(docBytes, len(chats)); err != nil {
+		return "", nil, fmt.Errorf("docx validate: %w", err)
+	}
+
+	docPath, err = a.saveDailyReportFile(orgID, reportDate, filename, docBytes)
+	if err != nil {
+		return "", nil, fmt.Errorf("save docx: %w", err)
+	}
+
+	// Confirm disk write
+	st, err := os.Stat(docPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("stat saved docx: %w", err)
+	}
+	if st.Size() < minDailyReportDOCXBytes {
+		return "", nil, fmt.Errorf("saved docx too small (%d bytes)", st.Size())
+	}
+
+	run.PDFPath = docPath
+	run.PDFFilename = filename
+	if b, e := json.Marshal(reportData); e == nil {
+		var m models.JSONB
+		if json.Unmarshal(b, &m) == nil {
+			run.SummaryJSON = m
+		}
+	}
+
+	// Full DB snapshot BEFORE any WhatsApp send.
+	if err := a.DB.Model(run).Updates(map[string]any{
+		"chat_count":    run.ChatCount,
+		"message_count": run.MessageCount,
+		"ai_model":      run.AIModel,
+		"summary_json":  run.SummaryJSON,
+		"pdf_path":      run.PDFPath,
+		"pdf_filename":  run.PDFFilename,
+		"error_message": run.ErrorMessage,
+	}).Error; err != nil {
+		return "", nil, fmt.Errorf("save run to db: %w", err)
+	}
+
+	a.Log.Info("Daily report phase=compose+db done",
+		"org", orgID, "file", filename, "bytes", st.Size(), "path", docPath)
+	return docPath, docBytes, nil
+}
+
+// isUsableDailyReportRun is true when schedule/manual may skip regeneration.
+// Blank, missing file, or completed-with-chats-but-no-summary are NOT usable.
+func isUsableDailyReportRun(run *models.DailyReportRun) bool {
+	if run == nil {
+		return false
+	}
+	if !dailyreport.IsTerminalRunStatus(run.Status) {
+		return false
+	}
+	if strings.TrimSpace(run.PDFPath) == "" || strings.TrimSpace(run.PDFFilename) == "" {
+		return false
+	}
+	st, err := os.Stat(run.PDFPath)
+	if err != nil || st.Size() < minDailyReportDOCXBytes {
+		return false
+	}
+	// Empty day is OK only if we intentionally stored empty status.
+	if run.Status == models.DailyReportStatusEmpty {
+		return true
+	}
+	// Completed with chats must have summary content in DB.
+	if run.ChatCount > 0 {
+		if run.SummaryJSON == nil {
+			return false
+		}
+		// summary_json should include a non-empty chats array when chat_count > 0
+		if raw, ok := run.SummaryJSON["chats"]; ok {
+			switch v := raw.(type) {
+			case []any:
+				if len(v) == 0 {
+					return false
+				}
+			case nil:
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	return true
+}
+
+// validateDailyReportDOCX rejects tiny or content-less Word packages before save/send.
+func validateDailyReportDOCX(docBytes []byte, chatCount int) error {
+	if len(docBytes) < minDailyReportDOCXBytes {
+		return fmt.Errorf("file too small (%d bytes)", len(docBytes))
+	}
+	if !bytes.HasPrefix(docBytes, []byte("PK")) {
+		return fmt.Errorf("not a valid DOCX (missing ZIP header)")
+	}
+	// Lightweight content check on raw bytes (document.xml is uncompressed enough often,
+	// but OOXML stores document.xml compressed — still "Daily Chat Report" may appear in
+	// local headers; also check ZIP member via dailyreport helper path).
+	// Prefer opening the package:
+	if err := dailyreport.ValidateDOCXContent(docBytes, chatCount); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, loc *time.Location) ([]dailyreport.ContactChat, int, error) {

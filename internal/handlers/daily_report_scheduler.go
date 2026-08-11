@@ -100,17 +100,25 @@ func (p *DailyReportScheduler) processOrgSchedule(s *models.DailyReportSettings,
 	}
 
 	// Source of truth for "already ran today" is the run row (not only settings audit).
+	force := false
 	var existing models.DailyReportRun
 	err := p.app.DB.Where("organization_id = ? AND report_date = ?", s.OrganizationID, reportDate).
 		Order("created_at desc").
 		First(&existing).Error
 	if err == nil {
 		if dailyreport.IsTerminalRunStatus(existing.Status) {
-			// Keep settings audit aligned (manual or prior schedule).
-			if s.LastScheduledDate != reportDate || s.LastScheduledStatus != existing.Status {
-				p.persistScheduleAudit(s, &existing, reportDate)
+			// Only skip when report file + summaries are real (manual works; schedule
+			// used to skip blank completed/empty rows forever).
+			if isUsableDailyReportRun(&existing) {
+				if s.LastScheduledDate != reportDate || s.LastScheduledStatus != existing.Status {
+					p.persistScheduleAudit(s, &existing, reportDate)
+				}
+				return
 			}
-			return
+			p.app.Log.Warn("Daily report schedule: prior run blank/unusable — force regenerate",
+				"org", s.OrganizationID, "date", reportDate,
+				"status", existing.Status, "chats", existing.ChatCount, "path", existing.PDFPath)
+			force = true
 		}
 		if existing.Status == models.DailyReportStatusRunning {
 			// AI + compose can take a while — do not reclaim while still within window.
@@ -130,9 +138,12 @@ func (p *DailyReportScheduler) processOrgSchedule(s *models.DailyReportSettings,
 		"date", reportDate,
 		"send_time", sendTime,
 		"timezone", s.Timezone,
+		"force", force,
 	)
 
-	run, runErr := p.app.RunDailyReport(s.OrganizationID, reportDate, models.DailyReportTriggerSchedule, false)
+	// Same pipeline as manual: generate → save DB/disk → validate → send.
+	// force=true when yesterday's schedule produced a blank artifact.
+	run, runErr := p.app.RunDailyReport(s.OrganizationID, reportDate, models.DailyReportTriggerSchedule, force)
 	if runErr != nil {
 		p.app.Log.Error("Daily report scheduled run failed",
 			"org", s.OrganizationID, "date", reportDate, "error", runErr)

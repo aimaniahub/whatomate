@@ -123,4 +123,18 @@ func TestBuildDOCX_Empty(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, bytes.HasPrefix(docx, []byte("PK")))
+	require.NoError(t, ValidateDOCXContent(docx, 0))
+}
+
+func TestValidateDOCXContent_RejectsNoChatsWhenChatsExpected(t *testing.T) {
+	docx, err := BuildDOCX(ReportData{
+		ReportDate:  "2026-07-31",
+		GeneratedAt: "2026-07-31 20:00",
+		OrgName:     "Test Org",
+		EmptyDay:    true,
+	})
+	require.NoError(t, err)
+	err = ValidateDOCXContent(docx, 3)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no chats")
 }
