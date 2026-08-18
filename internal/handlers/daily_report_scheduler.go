@@ -99,50 +99,63 @@ func (p *DailyReportScheduler) processOrgSchedule(s *models.DailyReportSettings,
 		return
 	}
 
-	// Source of truth for "already ran today" is the run row (not only settings audit).
-	force := false
 	var existing models.DailyReportRun
+	var existingPtr *dailyreport.ExistingRun
 	err := p.app.DB.Where("organization_id = ? AND report_date = ?", s.OrganizationID, reportDate).
 		Order("created_at desc").
 		First(&existing).Error
 	if err == nil {
-		if dailyreport.IsTerminalRunStatus(existing.Status) {
-			// Only skip when report file + summaries are real (manual works; schedule
-			// used to skip blank completed/empty rows forever).
-			if isUsableDailyReportRun(&existing) {
-				if s.LastScheduledDate != reportDate || s.LastScheduledStatus != existing.Status {
-					p.persistScheduleAudit(s, &existing, reportDate)
-				}
-				return
-			}
-			p.app.Log.Warn("Daily report schedule: prior run blank/unusable — force regenerate",
-				"org", s.OrganizationID, "date", reportDate,
-				"status", existing.Status, "chats", existing.ChatCount, "path", existing.PDFPath)
-			force = true
-		}
-		if existing.Status == models.DailyReportStatusRunning {
-			// AI + compose can take a while — do not reclaim while still within window.
-			if existing.StartedAt != nil && time.Since(*existing.StartedAt) < dailyReportStuckAfter {
-				return
+		probe := -1
+		// Empty / zero-chat terminal runs must be re-collected. Manual "Run now"
+		// always force-regenerates; schedule used to treat empty as done forever.
+		if existing.Status == models.DailyReportStatusEmpty ||
+			(dailyreport.IsTerminalRunStatus(existing.Status) && existing.ChatCount == 0) ||
+			(dailyreport.IsTerminalRunStatus(existing.Status) && !isUsableDailyReportRun(&existing)) {
+			if chats, _, cErr := p.app.collectDailyChats(s.OrganizationID, "", reportDate, loc); cErr != nil {
+				p.app.Log.Error("Daily report schedule: probe collect failed",
+					"org", s.OrganizationID, "date", reportDate, "error", cErr)
+			} else {
+				probe = len(chats)
 			}
 		}
-		// pending/failed → retry via RunDailyReport
+		existingPtr = &dailyreport.ExistingRun{
+			Status:         existing.Status,
+			ChatCount:      existing.ChatCount,
+			StartedAt:      existing.StartedAt,
+			FinishedAt:     existing.FinishedAt,
+			Usable:         isUsableDailyReportRun(&existing),
+			ProbeChatCount: probe,
+		}
 	} else if err != gorm.ErrRecordNotFound {
 		p.app.Log.Error("Daily report scheduler: load run failed",
 			"org", s.OrganizationID, "date", reportDate, "error", err)
 		return
 	}
 
+	action := dailyreport.DecideScheduleAction(now, loc, sendTime, reportDate, existingPtr)
+	switch action {
+	case dailyreport.ScheduleSkip:
+		if existingPtr != nil && (s.LastScheduledDate != reportDate || s.LastScheduledStatus != existing.Status) {
+			p.persistScheduleAudit(s, &existing, reportDate)
+		}
+		return
+	case dailyreport.ScheduleWait:
+		p.app.Log.Info("Daily report schedule: waiting until send time (no chats yet)",
+			"org", s.OrganizationID, "date", reportDate, "send_time", sendTime)
+		return
+	}
+
+	force := action == dailyreport.ScheduleForce
 	p.app.Log.Info("Daily report schedule firing",
 		"org", s.OrganizationID,
 		"date", reportDate,
 		"send_time", sendTime,
 		"timezone", s.Timezone,
+		"action", string(action),
 		"force", force,
 	)
 
 	// Same pipeline as manual: generate → save DB/disk → validate → send.
-	// force=true when yesterday's schedule produced a blank artifact.
 	run, runErr := p.app.RunDailyReport(s.OrganizationID, reportDate, models.DailyReportTriggerSchedule, force)
 	if runErr != nil {
 		p.app.Log.Error("Daily report scheduled run failed",

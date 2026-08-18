@@ -52,7 +52,7 @@ Rules:
 type DailyReportSettings struct {
 	BaseModel
 	OrganizationID  uuid.UUID `gorm:"type:uuid;uniqueIndex;not null" json:"organization_id"`
-	WhatsAppAccount string    `gorm:"size:100" json:"whatsapp_account"` // Account used to send + filter chats
+	WhatsAppAccount string    `gorm:"size:100" json:"whatsapp_account"` // Account used to send the report (chats collected from all org accounts)
 	Enabled         bool      `gorm:"default:false;index" json:"enabled"`
 	Timezone        string    `gorm:"size:64;default:'Asia/Kolkata'" json:"timezone"`
 	SendTime        string    `gorm:"size:8;default:'20:00'" json:"send_time"` // HH:MM local (normalized)

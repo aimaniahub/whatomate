@@ -219,6 +219,11 @@ async function load() {
       ? list.map((a: any) => ({ name: a.name || a.Name || '' })).filter((a: any) => a.name)
       : []
 
+    // Default Run now to the org's "today" so it matches the scheduled date.
+    if (!runDate.value && s.today_report_date) {
+      runDate.value = s.today_report_date
+    }
+
     await loadTemplates(form.value.whatsapp_account || '')
   } catch (e: any) {
     error.value = e?.response?.data?.message || e?.message || 'Failed to load daily reports'
@@ -406,6 +411,8 @@ onMounted(load)
               <CardTitle class="text-base">Schedule</CardTitle>
               <CardDescription>
                 Runs <strong>every day</strong> for that calendar day’s chats (timezone-aware).
+                Same collect → AI → Word → WhatsApp pipeline as Run now. Empty days are retried
+                until send time so late chats are not locked out.
               </CardDescription>
             </div>
             <Badge :variant="settings?.schedule_active ? 'default' : 'secondary'">
@@ -523,7 +530,7 @@ onMounted(load)
                 <Input v-model="form.send_time" type="time" :disabled="!canWrite" />
               </div>
               <div class="space-y-2">
-                <Label>WhatsApp account (sender + chat source)</Label>
+                <Label>WhatsApp account (sender)</Label>
                 <Select
                   v-if="accounts.length"
                   :model-value="form.whatsapp_account"
@@ -546,7 +553,7 @@ onMounted(load)
                   placeholder="Account name"
                 />
                 <p class="text-xs text-muted-foreground">
-                  Chats for this account are included. Report is sent from this account.
+                  Used only to send the report. Chats are collected from every account in the org for that day.
                 </p>
               </div>
             </div>
@@ -861,7 +868,15 @@ onMounted(load)
                     {{ run.error_message || run.send_errors }}
                   </p>
                 </TableCell>
-                <TableCell>{{ run.chat_count }} ({{ run.message_count }} msgs)</TableCell>
+                <TableCell>
+                  {{ run.chat_count }} ({{ run.message_count }} msgs)
+                  <p
+                    v-if="run.status === 'empty' && run.triggered_by === 'schedule'"
+                    class="text-xs text-muted-foreground"
+                  >
+                    Scheduler found no chats at fire time — it will retry if chats exist
+                  </p>
+                </TableCell>
                 <TableCell>{{ run.triggered_by }}</TableCell>
                 <TableCell>{{ run.sent_count }}</TableCell>
                 <TableCell class="text-xs text-muted-foreground">

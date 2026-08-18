@@ -171,6 +171,33 @@ func (a *App) RunDailyReport(orgID uuid.UUID, reportDate, triggeredBy string, fo
 	}
 	run.AIModel = aiModel
 
+	// Schedule + no chats yet + still before send_time: park as pending so
+	// the next tick (at send_time) can collect again. Manual always continues
+	// (user asked for this date now, even if empty).
+	if triggeredBy == models.DailyReportTriggerSchedule && len(chats) == 0 {
+		if sendAt, sErr := dailyreport.SendAt(time.Now(), loc, settings.SendTime); sErr == nil && time.Now().In(loc).Before(sendAt) {
+			a.Log.Info("Daily report schedule: 0 chats before send time — park pending, do not send",
+				"org", orgID, "date", reportDate, "send_time", settings.SendTime, "tz", loc.String())
+			_ = a.DB.Model(&run).Updates(map[string]any{
+				"status":        models.DailyReportStatusPending,
+				"triggered_by":  triggeredBy,
+				"chat_count":    0,
+				"message_count": 0,
+				"ai_model":      "none",
+				"error_message": "waiting until send time — no chats collected yet",
+				"started_at":    nil,
+				"finished_at":   nil,
+				"pdf_path":      "",
+				"pdf_filename":  "",
+			}).Error
+			run.Status = models.DailyReportStatusPending
+			run.ErrorMessage = "waiting until send time — no chats collected yet"
+			run.ChatCount = 0
+			run.MessageCount = 0
+			return &run, nil
+		}
+	}
+
 	// ── B) SAVE to disk + DB first (gate before any send) ─────────────
 	filename := fmt.Sprintf("daily-chat-report-%s.docx", reportDate)
 	docPath, docBytes, saveErr := a.persistDailyReportArtifact(orgID, &run, reportDate, filename, reportData, chats)
@@ -252,8 +279,12 @@ func (a *App) generateDailyReportContent(
 	genAt := time.Now().In(loc).Format("2006-01-02 15:04")
 
 	if len(chats) == 0 {
+		// Schedule must not lock an empty day before send_time — chats often
+		// arrive later the same afternoon. Return a sentinel empty dataset;
+		// RunDailyReport parks the row as pending instead of sending.
 		reportData = dailyreport.FallbackSummarize(reportDate, orgName, chats)
 		reportData.GeneratedAt = genAt
+		reportData.Overview.Notes = fmt.Sprintf("No conversations found for %s (%s).", reportDate, loc.String())
 		aiModel = "none"
 		a.Log.Info("Daily report phase=ai skipped (empty day)", "org", orgID, "date", reportDate)
 		return reportData, chats, aiModel, nil
@@ -385,9 +416,11 @@ func isUsableDailyReportRun(run *models.DailyReportRun) bool {
 	if err != nil || st.Size() < minDailyReportDOCXBytes {
 		return false
 	}
-	// Empty day is OK only if we intentionally stored empty status.
+	// Empty is NEVER "usable" for skip: the scheduler probes collect again
+	// and regenerates when chats exist. Treating empty as done was why
+	// scheduled sends stayed blank while manual (force=true) worked.
 	if run.Status == models.DailyReportStatusEmpty {
-		return true
+		return false
 	}
 	// Completed with chats must have summary content in DB.
 	if run.ChatCount > 0 {
@@ -430,7 +463,7 @@ func validateDailyReportDOCX(docBytes []byte, chatCount int) error {
 }
 
 func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, loc *time.Location) ([]dailyreport.ContactChat, int, error) {
-	start, end, err := dailyreport.DayBounds(reportDate, loc)
+	sqlStart, sqlEnd, _, _, err := dailyreport.CollectSQLWindow(reportDate, loc)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -438,43 +471,92 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 	// Prefer explicit Table+Scan with column aliases — custom Find/Select on
 	// Model(&Message{}) can leave Content empty on some GORM/driver combos.
 	type row struct {
-		ContactID         uuid.UUID `gorm:"column:contact_id"`
-		ProfileName       string    `gorm:"column:profile_name"`
-		PhoneNumber       string    `gorm:"column:phone_number"`
-		Direction         string    `gorm:"column:direction"`
-		Content           string    `gorm:"column:content"`
-		MessageType       string    `gorm:"column:message_type"`
-		TemplateName      string    `gorm:"column:template_name"`
-		MediaFilename     string    `gorm:"column:media_filename"`
-		InteractiveJSON   string    `gorm:"column:interactive_json"`
-		CreatedAt         time.Time `gorm:"column:created_at"`
+		ContactID       uuid.UUID `gorm:"column:contact_id"`
+		ProfileName     string    `gorm:"column:profile_name"`
+		PhoneNumber     string    `gorm:"column:phone_number"`
+		Direction       string    `gorm:"column:direction"`
+		Content         string    `gorm:"column:content"`
+		MessageType     string    `gorm:"column:message_type"`
+		TemplateName    string    `gorm:"column:template_name"`
+		MediaFilename   string    `gorm:"column:media_filename"`
+		InteractiveJSON string    `gorm:"column:interactive_json"`
+		CreatedAt       time.Time `gorm:"column:created_at"`
+		WhatsAppAccount string    `gorm:"column:whats_app_account"`
 	}
 
 	// Cast jsonb → text so Scan never fails on interactive_data driver types.
+	// LEFT JOIN so soft-deleted contacts still contribute their day's chats.
+	// Do NOT filter by the send WhatsApp account — that field is only the
+	// outbound sender. Filtering it was the usual reason scheduled reports
+	// came back with 0 chats while the inbox was full.
 	q := a.DB.Table("messages").
 		Select(`messages.contact_id AS contact_id,
-			contacts.profile_name AS profile_name,
-			contacts.phone_number AS phone_number,
+			COALESCE(contacts.profile_name, '') AS profile_name,
+			COALESCE(contacts.phone_number, '') AS phone_number,
 			messages.direction AS direction,
 			COALESCE(messages.content, '') AS content,
 			COALESCE(messages.message_type, '') AS message_type,
 			COALESCE(messages.template_name, '') AS template_name,
 			COALESCE(messages.media_filename, '') AS media_filename,
 			COALESCE(messages.interactive_data::text, '') AS interactive_json,
-			messages.created_at AS created_at`).
-		Joins("JOIN contacts ON contacts.id = messages.contact_id AND contacts.deleted_at IS NULL").
+			messages.created_at AS created_at,
+			COALESCE(messages.whats_app_account, '') AS whats_app_account`).
+		Joins("LEFT JOIN contacts ON contacts.id = messages.contact_id").
 		Where("messages.organization_id = ? AND messages.deleted_at IS NULL", orgID).
-		Where("messages.created_at >= ? AND messages.created_at < ?", start, end).
+		Where("messages.created_at >= ? AND messages.created_at < ?", sqlStart, sqlEnd).
 		Order("messages.contact_id asc, messages.created_at asc")
-
-	if strings.TrimSpace(waAccount) != "" {
-		q = q.Where("messages.whats_app_account = ?", waAccount)
-	}
 
 	var rows []row
 	if err := q.Scan(&rows).Error; err != nil {
 		return nil, 0, err
 	}
+
+	// Date filter: prefer timezone-correct instants; if that yields nothing
+	// (created_at stored as naive local wall clock), fall back to Y-M-D match.
+	instantHits, naiveHits := 0, 0
+	for _, r := range rows {
+		if dailyreport.InstantOnReportDate(r.CreatedAt, reportDate, loc) {
+			instantHits++
+		}
+		if dailyreport.NaiveWallClockOnReportDate(r.CreatedAt, reportDate) {
+			naiveHits++
+		}
+	}
+	useNaive := !dailyreport.PreferInstantDateFilter(instantHits, naiveHits)
+	filtered := make([]row, 0, len(rows))
+	accountMatch := 0
+	wantAccount := dailyreport.NormalizeAccountFilter(waAccount)
+	for _, r := range rows {
+		onDay := dailyreport.InstantOnReportDate(r.CreatedAt, reportDate, loc)
+		if useNaive {
+			onDay = dailyreport.NaiveWallClockOnReportDate(r.CreatedAt, reportDate)
+		}
+		if !onDay {
+			continue
+		}
+		if wantAccount != "" && r.WhatsAppAccount == wantAccount {
+			accountMatch++
+		}
+		filtered = append(filtered, r)
+	}
+	rows = filtered
+
+	strictStart, strictEnd, _ := dailyreport.DayBounds(reportDate, loc)
+	a.Log.Info("Daily report collect window",
+		"org", orgID,
+		"report_date", reportDate,
+		"timezone", loc.String(),
+		"sql_start", sqlStart.UTC().Format(time.RFC3339),
+		"sql_end", sqlEnd.UTC().Format(time.RFC3339),
+		"strict_start_utc", strictStart.UTC().Format(time.RFC3339),
+		"strict_end_utc", strictEnd.UTC().Format(time.RFC3339),
+		"date_filter", dailyreport.DateFilterLabel(useNaive),
+		"instant_hits", instantHits,
+		"naive_hits", naiveHits,
+		"after_date_filter", len(rows),
+		"send_account", wantAccount,
+		"rows_matching_send_account", accountMatch,
+	)
 
 	emptyContent := 0
 	withText := 0
@@ -490,9 +572,8 @@ func (a *App) collectDailyChats(orgID uuid.UUID, waAccount, reportDate string, l
 		"org", orgID,
 		"report_date", reportDate,
 		"timezone", loc.String(),
-		"start_utc", start.UTC().Format(time.RFC3339),
-		"end_utc", end.UTC().Format(time.RFC3339),
-		"account_filter", strings.TrimSpace(waAccount),
+		"date_filter", dailyreport.DateFilterLabel(useNaive),
+		"account_filter", "all",
 		"raw_rows", len(rows),
 		"rows_with_content", withText,
 		"rows_empty_content", emptyContent,
